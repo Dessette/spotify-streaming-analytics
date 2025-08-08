@@ -12,37 +12,40 @@ from collections import deque, defaultdict
 from datetime import datetime, timedelta
 import logging
 
-# Logging ayarları
+from timeless_genre_analytics import TimelessGenreAnalyzer
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class SpotifyDashboard:
     def __init__(self, kafka_servers='localhost:9092'):
-        """
-        Real-time Spotify Analytics Dashboard (Confluent Kafka)
-        """
         self.kafka_servers = kafka_servers
-        self.app = dash.Dash(__name__, external_stylesheets=['https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap'])
+        self.app = dash.Dash(__name__)
         
-        # Data buffers - Real-time veri saklamak için
-        self.max_buffer_size = 10000
+        # Küçültülmüş data buffers
+        self.max_buffer_size = 2000
         self.data_buffers = {
             'songs': deque(maxlen=self.max_buffer_size),
-            'genre_trends': deque(maxlen=200),
-            'real_time_events': deque(maxlen=100),
-            'audio_features': deque(maxlen=300),
-            'popularity_timeline': deque(maxlen=500),
-            'artist_stats': deque(maxlen=200)
+            'genre_trends': deque(maxlen=100),
+            'real_time_events': deque(maxlen=50),
+            'audio_features': deque(maxlen=150),
+            'popularity_timeline': deque(maxlen=250),
+            'artist_stats': deque(maxlen=100)
         }
         
-        # Performance metrics
+        self.timeless_analyzer = TimelessGenreAnalyzer(analysis_periods=[5, 10])
+        
         self.performance_metrics = {
             'messages_processed': 0,
             'last_update': datetime.now(),
             'processing_rate': 0.0,
             'start_time': datetime.now(),
             'genres_count': 0,
-            'artists_count': 0
+            'artists_count': 0,
+            'timeless_analysis_count': 0,
+            'timeout_events': 0,
+            'active_events': 0,
+            'rollback_events': 0
         }
         
         self.running = True
@@ -51,7 +54,6 @@ class SpotifyDashboard:
         self.setup_callbacks()
         
     def setup_kafka_consumer(self):
-        """Confluent Kafka consumer'ını kurma ve background thread başlatma"""
         try:
             self.consumer_config = {
                 'bootstrap.servers': self.kafka_servers,
@@ -65,39 +67,31 @@ class SpotifyDashboard:
             topics = ['spotify-historical-stream', 'spotify-realtime-events']
             self.consumer.subscribe(topics)
             
-            # Kafka bağlantısını test et
-            logger.info("🔄 Kafka bağlantısı test ediliyor...")
-            test_msg = self.consumer.poll(timeout=2.0)
-            
-            # Background thread'i başlat
             self.consumer_thread = threading.Thread(
                 target=self.consume_kafka_messages, 
                 daemon=True
             )
             self.consumer_thread.start()
-            logger.info("✅ Kafka consumer başlatıldı")
+            logger.info("Kafka consumer started")
             
         except Exception as e:
-            logger.error(f"❌ Kafka consumer hatası: {e}")
+            logger.error(f"Kafka consumer error: {e}")
     
     def consume_kafka_messages(self):
-        """Kafka mesajlarını sürekli oku ve buffer'lara ekle"""
-        logger.info("🎵 Kafka mesaj tüketimi başladı...")
+        logger.info("Kafka message consumption started")
         
         consecutive_errors = 0
         max_errors = 10
+        timeless_update_counter = 0
         
         while self.running:
             try:
                 msg = self.consumer.poll(timeout=2.0)
                 
                 if msg is None:
-                    # Kafka'dan mesaj gelmiyor, mock data'ya geç
-                    if consecutive_errors == 0:  # İlk kez uyar
-                        logger.warning("⚠️ Kafka'dan mesaj gelmiyor")
                     consecutive_errors += 1
                     if consecutive_errors > max_errors:
-                        consecutive_errors = 0  # Reset counter
+                        consecutive_errors = 0
                     continue
                     
                 if msg.error():
@@ -108,76 +102,87 @@ class SpotifyDashboard:
                         continue
                 
                 try:
-                    # JSON parse et
                     data = json.loads(msg.value().decode('utf-8'))
                     topic = msg.topic()
                     
-                    # Mesajı uygun buffer'a ekle
                     if topic == 'spotify-historical-stream':
                         self.process_song_data(data)
-                        logger.debug(f"📥 Song data alındı: {data.get('song_data', {}).get('title', 'Unknown')}")
+                        
+                        if 'song_data' in data:
+                            self.timeless_analyzer.add_song_data(data['song_data'])
+                            timeless_update_counter += 1
+                            
+                            # Her 50 şarkıda bir timeless analizi (100'den azaltıldı)
+                            if timeless_update_counter % 50 == 0:
+                                self.update_timeless_analysis()
+                                timeless_update_counter = 0
+                        
                     elif topic == 'spotify-realtime-events':
                         self.process_real_time_event(data)
-                        logger.info(f"🔥 Real-time event alındı: {data.get('event_type', 'unknown')}")
                     
-                    # Performance metriklerini güncelle
                     self.performance_metrics['messages_processed'] += 1
-                    consecutive_errors = 0  # Reset error counter
+                    consecutive_errors = 0
                     
-                    # Her 50 mesajda bir rate hesapla
                     if self.performance_metrics['messages_processed'] % 50 == 0:
                         now = datetime.now()
                         time_diff = (now - self.performance_metrics['last_update']).total_seconds()
                         if time_diff > 0:
                             self.performance_metrics['processing_rate'] = 50 / time_diff
                         self.performance_metrics['last_update'] = now
-                        logger.info(f"📊 Dashboard: {self.performance_metrics['messages_processed']} mesaj işlendi")
                         
                 except json.JSONDecodeError as e:
                     logger.error(f"JSON decode error: {e}")
-                    consecutive_errors += 1
                 except Exception as e:
                     logger.error(f"Message processing error: {e}")
-                    consecutive_errors += 1
                     
             except Exception as e:
-                logger.error(f"Kafka tüketim hatası: {e}")
-                consecutive_errors += 1
-                time.sleep(5)  # Hata durumunda bekle
+                logger.error(f"Kafka consumption error: {e}")
+                time.sleep(5)
+    
+    def update_timeless_analysis(self):
+        try:
+            self.timeless_analyzer.analyze_genre_timelessness()
+            self.performance_metrics['timeless_analysis_count'] += 1
+            logger.info("Timeless genre analysis updated")
+        except Exception as e:
+            logger.error(f"Timeless analysis error: {e}")
     
     def process_song_data(self, data):
-        """Şarkı verisini işle ve buffer'a ekle"""
         if 'song_data' in data:
             song = data['song_data']
             song['timestamp'] = datetime.now()
             song['event_type'] = data.get('event_type', 'historical')
             
             self.data_buffers['songs'].append(song)
-            
-            # Genre trend'i güncelle
             self.update_genre_trends(song)
-            
-            # Audio features'ı güncelle
             self.update_audio_features(song)
-            
-            # Popularity timeline'ı güncelle
             self.update_popularity_timeline(song)
-            
-            # Artist stats'ı güncelle
             self.update_artist_stats(song)
     
     def process_real_time_event(self, data):
-        """Real-time event'leri işle"""
+        event_type = data.get('event_type', 'unknown')
+        
         event = {
             'timestamp': datetime.now(),
             'song': data.get('song_data', {}),
             'metadata': data.get('metadata', {}),
-            'event_type': data.get('event_type', 'unknown')
+            'event_type': event_type,
+            'status': 'active' if event_type == 'popularity_surge' else 'rollback' if event_type == 'timeout_rollback' else 'unknown'
         }
+        
+        # Timeout metrics güncelle
+        if event_type == 'popularity_surge':
+            self.performance_metrics['timeout_events'] += 1
+            if data.get('metadata', {}).get('has_timeout'):
+                self.performance_metrics['active_events'] += 1
+        elif event_type == 'timeout_rollback':
+            self.performance_metrics['rollback_events'] += 1
+            if self.performance_metrics['active_events'] > 0:
+                self.performance_metrics['active_events'] -= 1
+        
         self.data_buffers['real_time_events'].append(event)
     
     def update_genre_trends(self, song):
-        """Genre trend verilerini güncelle"""
         genre_data = {
             'genre': song['top_genre'],
             'popularity': song['popularity'],
@@ -187,7 +192,6 @@ class SpotifyDashboard:
         self.data_buffers['genre_trends'].append(genre_data)
     
     def update_audio_features(self, song):
-        """Audio features verilerini güncelle"""
         features = {
             'timestamp': song['timestamp'],
             'energy': song['energy'],
@@ -200,7 +204,6 @@ class SpotifyDashboard:
         self.data_buffers['audio_features'].append(features)
     
     def update_popularity_timeline(self, song):
-        """Popularity timeline'ını güncelle"""
         timeline_data = {
             'timestamp': song['timestamp'],
             'popularity': song['popularity'],
@@ -212,7 +215,6 @@ class SpotifyDashboard:
         self.data_buffers['popularity_timeline'].append(timeline_data)
     
     def update_artist_stats(self, song):
-        """Artist istatistiklerini güncelle"""
         artist_data = {
             'timestamp': song['timestamp'],
             'artist': song['artist'],
@@ -222,7 +224,6 @@ class SpotifyDashboard:
         }
         self.data_buffers['artist_stats'].append(artist_data)
         
-        # Performance metrics güncelle
         unique_genres = set(g['genre'] for g in self.data_buffers['genre_trends'])
         unique_artists = set(a['artist'] for a in self.data_buffers['artist_stats'])
         
@@ -230,115 +231,393 @@ class SpotifyDashboard:
         self.performance_metrics['artists_count'] = len(unique_artists)
     
     def setup_layout(self):
-        """Dashboard layout'unu kur"""
         self.app.layout = html.Div([
             # Header
             html.Div([
-                html.H1("🎵 Spotify Real-time Analytics Dashboard", className="header-title"),
-                html.Div(id="live-indicator", children="🔴 LIVE", className="live-indicator"),
+                html.H1("Spotify Real-time Analytics Dashboard", className="header-title"),
+                html.Div([
+                    html.Div(id="live-indicator", children="LIVE", className="live-indicator"),
+                ], className="status-indicators"),
                 html.Div(id="performance-metrics", className="performance-metrics")
             ], className="header"),
             
-            # Ana container
             html.Div([
-                # Üst satır - Ana metrikler
+                # Ana metrikler
                 html.Div([
-                    # Real-time popularity gauge
-                    html.Div([
-                        dcc.Graph(id="popularity-gauge")
-                    ], className="metric-card"),
-                    
-                    # Song count
-                    html.Div([
-                        dcc.Graph(id="song-count-metric")
-                    ], className="metric-card"),
-                    
-                    # Top genre
-                    html.Div([
-                        dcc.Graph(id="top-genre-metric")
-                    ], className="metric-card"),
-                    
-                    # Artists count
-                    html.Div([
-                        dcc.Graph(id="artists-count-metric")
-                    ], className="metric-card")
+                    html.Div([dcc.Graph(id="popularity-gauge")], className="metric-card"),
+                    html.Div([dcc.Graph(id="song-count-metric")], className="metric-card"),
+                    html.Div([dcc.Graph(id="top-genre-metric")], className="metric-card"),
+                    html.Div([dcc.Graph(id="timeless-champion-metric")], className="metric-card")
+                ], className="metrics-row"),
+
+                # Trend grafikleri
+                html.Div([
+                    html.Div([dcc.Graph(id="genre-trends-chart")], className="chart-card"),
+                    html.Div([dcc.Graph(id="popularity-timeline")], className="chart-card")
+                ], className="charts-row"),
+
+                # Timeless Analytics
+                html.Div([
+                    html.Div([dcc.Graph(id="timeless-rankings-chart")], className="chart-card"),
+                    html.Div([dcc.Graph(id="timeless-score-distribution")], className="chart-card")
+                ], className="charts-row"),
+                
+                # Timeless Timeline
+                html.Div([
+                    html.Div([dcc.Graph(id="timeless-genre-timeline")], className="chart-card-full")
+                ], className="charts-row"),
+
+                html.Div([
+                    html.Div([dcc.Graph(id="active-events-gauge")], className="metric-card")
                 ], className="metrics-row"),
                 
-                # İkinci satır - Trend grafikleri
+                # Audio features ve events
                 html.Div([
-                    # Genre popularity trends
-                    html.Div([
-                        dcc.Graph(id="genre-trends-chart")
-                    ], className="chart-card"),
-                    
-                    # Popularity timeline
-                    html.Div([
-                        dcc.Graph(id="popularity-timeline")
-                    ], className="chart-card")
+                    html.Div([dcc.Graph(id="audio-features-radar")], className="chart-card"),
+                    html.Div([dcc.Graph(id="real-time-events")], className="chart-card")
                 ], className="charts-row"),
                 
-                # Üçüncü satır - Audio features ve events
+                # Timeless Metrics Overview
                 html.Div([
-                    # Audio features radar
-                    html.Div([
-                        dcc.Graph(id="audio-features-radar")
-                    ], className="chart-card"),
-                    
-                    # Real-time events
-                    html.Div([
-                        dcc.Graph(id="real-time-events")
-                    ], className="chart-card")
-                ], className="charts-row"),
-                
-                # Alt satır - Detaylı analizler
-                html.Div([
-                    # Year distribution heatmap
-                    html.Div([
-                        dcc.Graph(id="year-genre-heatmap")
-                    ], className="chart-card-full")
+                    html.Div([dcc.Graph(id="timeless-metrics-overview")], className="chart-card-full")
                 ], className="charts-row")
             ], className="main-container"),
             
-            # Update interval
+            # Update intervals - azaltıldı
             dcc.Interval(
                 id='interval-component',
-                interval=2000,  # 2 saniyede bir güncelle
+                interval=2000,  # 3000ms -> 2000ms
+                n_intervals=0
+            ),
+            
+            dcc.Interval(
+                id='timeless-interval',
+                interval=15000,  # 30000ms -> 15000ms
                 n_intervals=0
             )
         ])
     
     def setup_callbacks(self):
-        """Dashboard callback'lerini kur"""
-        
         @self.app.callback(
             [Output('popularity-gauge', 'figure'),
              Output('song-count-metric', 'figure'),
              Output('top-genre-metric', 'figure'),
-             Output('artists-count-metric', 'figure'),
+             Output('timeless-champion-metric', 'figure'),
+             Output('active-events-gauge', 'figure'),
+             Output('timeless-rankings-chart', 'figure'),
+             Output('timeless-score-distribution', 'figure'),
              Output('genre-trends-chart', 'figure'),
              Output('popularity-timeline', 'figure'),
+             Output('timeless-genre-timeline', 'figure'),
              Output('audio-features-radar', 'figure'),
              Output('real-time-events', 'figure'),
-             Output('year-genre-heatmap', 'figure'),
+             Output('timeless-metrics-overview', 'figure'),
              Output('performance-metrics', 'children')],
-            [Input('interval-component', 'n_intervals')]
+            [Input('interval-component', 'n_intervals'),
+             Input('timeless-interval', 'n_intervals')]
         )
-        def update_dashboard(n):
+        def update_dashboard(n, timeless_n):
             return (
                 self.create_popularity_gauge(),
                 self.create_song_count_metric(),
                 self.create_top_genre_metric(),
-                self.create_artists_count_metric(),
+                self.create_timeless_champion_metric(),
+                self.create_active_events_gauge(),
+                self.create_timeless_rankings_chart(),
+                self.create_timeless_score_distribution(),
                 self.create_genre_trends_chart(),
                 self.create_popularity_timeline(),
+                self.create_timeless_genre_timeline(),
                 self.create_audio_features_radar(),
                 self.create_real_time_events_chart(),
-                self.create_year_genre_heatmap(),
+                self.create_timeless_metrics_overview(),
                 self.create_performance_metrics()
             )
     
+    def create_timeless_champion_metric(self):
+        try:
+            top_timeless = self.timeless_analyzer.get_top_timeless_genres(1)
+            
+            if not top_timeless:
+                champion_text = "Analyzing..."
+                score_text = "..."
+            else:
+                genre, metric = top_timeless[0]
+                champion_text = genre.title()
+                score_text = f"{metric.timeless_score:.1f}/100"
+            
+            fig = go.Figure()
+            fig.add_annotation(
+                text=f"<b>Timeless Champion</b><br><span style='font-size:20px; color:#FFD700'>{champion_text}</span><br><span style='font-size:16px; color:#1DB954'>{score_text}</span>",
+                x=0.5, y=0.5,
+                xref="paper", yref="paper",
+                showarrow=False,
+                font=dict(size=14, color="white"),
+                align="center"
+            )
+            
+            fig.update_layout(
+                height=200, 
+                margin=dict(l=20, r=20, t=40, b=20), 
+                paper_bgcolor='rgba(0,0,0,0)', 
+                plot_bgcolor='rgba(0,0,0,0)',
+                xaxis=dict(visible=False),
+                yaxis=dict(visible=False)
+            )
+            return fig
+            
+        except Exception as e:
+            logger.error(f"Timeless champion metric error: {e}")
+            return go.Figure().add_annotation(text="Error", showarrow=False, font=dict(color="white"))
+    
+    def create_timeless_rankings_chart(self):
+        try:
+            top_timeless = self.timeless_analyzer.get_top_timeless_genres(8)
+            
+            if not top_timeless:
+                return go.Figure().add_annotation(text="Timeless analysis pending...", showarrow=False, font=dict(color="white"))
+            
+            genres = [genre for genre, metric in top_timeless]
+            scores = [metric.timeless_score for genre, metric in top_timeless]
+            decades = [metric.decade_presence for genre, metric in top_timeless]
+            
+            hover_text = [
+                f"Genre: {genre}<br>"
+                f"Timeless Score: {score:.1f}/100<br>"
+                f"Decade Presence: {decade} periods<br>"
+                f"Consistency: {top_timeless[i][1].consistency_score:.1f}/100"
+                for i, (genre, score, decade) in enumerate(zip(genres, scores, decades))
+            ]
+            
+            fig = go.Figure()
+            
+            fig.add_trace(go.Bar(
+                x=genres,
+                y=scores,
+                text=[f"{score:.1f}" for score in scores],
+                textposition='outside',
+                hovertext=hover_text,
+                hoverinfo='text',
+                marker=dict(
+                    color=scores,
+                    colorscale='Viridis',
+                    colorbar=dict(title="Timeless Score")
+                )
+            ))
+            
+            fig.update_layout(
+                title="Top Timeless Genres Rankings",
+                xaxis_title="Genres",
+                yaxis_title="Timeless Score",
+                height=350,
+                margin=dict(l=20, r=20, t=40, b=20),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font=dict(color="white"),
+                title_font_color="white"
+            )
+            
+            fig.update_xaxes(tickangle=45)
+            return fig
+            
+        except Exception as e:
+            logger.error(f"Timeless rankings chart error: {e}")
+            return go.Figure().add_annotation(text="Chart error", showarrow=False, font=dict(color="white"))
+    
+    def create_timeless_score_distribution(self):
+        try:
+            analytics_summary = self.timeless_analyzer.get_analytics_summary()
+            
+            if not analytics_summary.get('top_timeless_genres'):
+                return go.Figure().add_annotation(text="Score distribution pending...", showarrow=False, font=dict(color="white"))
+            
+            all_metrics = list(self.timeless_analyzer.timeless_metrics.values())
+            
+            if len(all_metrics) < 3:
+                return go.Figure().add_annotation(text="Insufficient data", showarrow=False, font=dict(color="white"))
+            
+            timeless_scores = [m.timeless_score for m in all_metrics]
+            
+            fig = go.Figure()
+            
+            fig.add_trace(go.Histogram(
+                x=timeless_scores,
+                name="Timeless Scores",
+                opacity=0.7,
+                nbinsx=10,
+                marker_color='#1DB954'
+            ))
+            
+            fig.update_layout(
+                title="Timeless Score Distribution",
+                xaxis_title="Timeless Score",
+                yaxis_title="Genre Count",
+                height=350,
+                margin=dict(l=20, r=20, t=40, b=20),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font=dict(color="white"),
+                title_font_color="white",
+                showlegend=False
+            )
+            
+            avg_score = np.mean(timeless_scores)
+            fig.add_vline(
+                x=avg_score, 
+                line_dash="dash", 
+                line_color="red",
+                annotation_text=f"Avg: {avg_score:.1f}",
+                annotation_position="top"
+            )
+            
+            return fig
+            
+        except Exception as e:
+            logger.error(f"Score distribution error: {e}")
+            return go.Figure().add_annotation(text="Distribution error", showarrow=False, font=dict(color="white"))
+    
+    def create_timeless_genre_timeline(self):
+        try:
+            top_timeless = self.timeless_analyzer.get_top_timeless_genres(1)
+            
+            if not top_timeless:
+                return go.Figure().add_annotation(text="Timeline pending...", showarrow=False, font=dict(color="white"))
+            
+            genre, metric = top_timeless[0]
+            timeline_data = self.timeless_analyzer.get_genre_timeline(genre)
+            
+            if not timeline_data.get('timeline'):
+                return go.Figure().add_annotation(text="Timeline data missing", showarrow=False, font=dict(color="white"))
+            
+            timeline = timeline_data['timeline']
+            
+            periods = [t['period'] for t in timeline]
+            avg_popularities = [t['avg_popularity'] for t in timeline]
+            song_counts = [t['song_count'] for t in timeline]
+            
+            fig = go.Figure()
+            
+            fig.add_trace(go.Scatter(
+                x=periods,
+                y=avg_popularities,
+                mode='lines+markers',
+                name='Avg Popularity',
+                line=dict(color='#1DB954', width=3),
+                marker=dict(size=8),
+                hovertemplate='<b>%{x}</b><br>Popularity: %{y:.1f}<br><extra></extra>'
+            ))
+            
+            fig.add_trace(go.Bar(
+                x=periods,
+                y=song_counts,
+                name='Song Count',
+                opacity=0.6,
+                marker_color='lightblue',
+                yaxis='y2',
+                hovertemplate='<b>%{x}</b><br>Songs: %{y}<br><extra></extra>'
+            ))
+            
+            fig.update_layout(
+                title=f"{genre.title()} - Timeless Journey (Score: {metric.timeless_score:.1f}/100)",
+                xaxis_title="Time Periods",
+                yaxis_title="Average Popularity",
+                height=400,
+                margin=dict(l=20, r=20, t=40, b=20),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font=dict(color="white"),
+                title_font_color="white",
+                yaxis2=dict(
+                    title="Song Count",
+                    overlaying='y',
+                    side='right',
+                    color='lightblue'
+                )
+            )
+            
+            fig.update_xaxes(tickangle=45)
+            return fig
+            
+        except Exception as e:
+            logger.error(f"Timeless timeline error: {e}")
+            return go.Figure().add_annotation(text="Timeline error", showarrow=False, font=dict(color="white"))
+    
+    def create_timeless_metrics_overview(self):
+        try:
+            analytics_summary = self.timeless_analyzer.get_analytics_summary()
+            
+            if not analytics_summary:
+                return go.Figure().add_annotation(text="Metrics overview pending...", showarrow=False, font=dict(color="white"))
+            
+            top_genres = analytics_summary.get('top_timeless_genres', [])[:6]
+            
+            if not top_genres:
+                return go.Figure().add_annotation(text="Insufficient genres analyzed", showarrow=False, font=dict(color="white"))
+            
+            genres = [g['genre'].title() for g in top_genres]
+            scores = [f"{g['score']:.1f}" for g in top_genres]
+            decades = [f"{g['decades']}" for g in top_genres]
+            consistency = [f"{g['consistency']:.1f}" for g in top_genres]
+            
+            score_values = [g['score'] for g in top_genres]
+            max_score = max(score_values) if score_values else 100
+            
+            colors = []
+            for score in score_values:
+                intensity = score / max_score
+                colors.append(f'rgba(29, 185, 84, {intensity * 0.7 + 0.3})')
+            
+            fig = go.Figure(data=[go.Table(
+                header=dict(
+                    values=['Genre', 'Timeless Score', 'Decades', 'Consistency'],
+                    fill_color='rgba(29, 185, 84, 0.8)',
+                    align='center',
+                    font=dict(color='white', size=14),
+                    height=40
+                ),
+                cells=dict(
+                    values=[genres, scores, decades, consistency],
+                    fill_color=[colors, colors, colors, colors],
+                    align='center',
+                    font=dict(color='white', size=12),
+                    height=35
+                )
+            )])
+            
+            stats = analytics_summary.get('statistics', {})
+            subtitle = f"{stats.get('total_genres_analyzed', 0)} genres analyzed | Avg Score: {stats.get('avg_timeless_score', 0):.1f} | Max: {stats.get('max_timeless_score', 0):.1f}"
+            
+            fig.update_layout(
+                title=f"Timeless Metrics Overview<br><sub>{subtitle}</sub>",
+                height=300,
+                margin=dict(l=20, r=20, t=60, b=20),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font=dict(color="white"),
+                title_font_color="white"
+            )
+            
+            return fig
+            
+        except Exception as e:
+            logger.error(f"Metrics overview error: {e}")
+    
+    def create_active_events_gauge(self):
+        """Aktif event sayısı"""
+        active_events = self.performance_metrics['active_events']
+        
+        fig = go.Figure()
+        fig.add_trace(go.Indicator(
+            mode = "number",
+            value = active_events,
+            title = {"text": "Active Events", "font": {"size": 14}},
+            number = {"font": {"size": 40, "color": "#FFA500" if active_events > 0 else "#1DB954"}}
+        ))
+        
+        fig.update_layout(height=200, margin=dict(l=20, r=20, t=40, b=20), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        return fig
+    
     def create_popularity_gauge(self):
-        """Popularity gauge grafiği"""
         if not self.data_buffers['songs']:
             current_popularity = 0
         else:
@@ -349,7 +628,7 @@ class SpotifyDashboard:
             mode = "gauge+number+delta",
             value = current_popularity,
             domain = {'x': [0, 1], 'y': [0, 1]},
-            title = {'text': "Ortalama Popülerlik (Son 20 Şarkı)", 'font': {'size': 14}},
+            title = {'text': "Average Popularity (Last 20 Songs)", 'font': {'size': 14}},
             delta = {'reference': 50},
             gauge = {
                 'axis': {'range': [None, 100]},
@@ -368,14 +647,13 @@ class SpotifyDashboard:
         return fig
     
     def create_song_count_metric(self):
-        """Şarkı sayısı metriği"""
         total_songs = len(self.data_buffers['songs'])
         
         fig = go.Figure()
         fig.add_trace(go.Indicator(
             mode = "number",
             value = total_songs,
-            title = {"text": "Toplam Şarkı", "font": {"size": 14}},
+            title = {"text": "Total Songs", "font": {"size": 14}},
             number = {"font": {"size": 40, "color": "#1DB954"}}
         ))
         
@@ -383,7 +661,6 @@ class SpotifyDashboard:
         return fig
     
     def create_top_genre_metric(self):
-        """En popüler genre metriği"""
         if not self.data_buffers['genre_trends']:
             top_genre = "N/A"
         else:
@@ -397,10 +674,9 @@ class SpotifyDashboard:
             else:
                 top_genre = "N/A"
         
-        # Plotly Indicator için sadece number mode kullan
         fig = go.Figure()
         fig.add_annotation(
-            text=f"<b>En Popüler Genre</b><br><span style='font-size:24px; color:#1DB954'>{top_genre}</span>",
+            text=f"<b>Top Genre</b><br><span style='font-size:24px; color:#1DB954'>{top_genre}</span>",
             x=0.5, y=0.5,
             xref="paper", yref="paper",
             showarrow=False,
@@ -418,34 +694,16 @@ class SpotifyDashboard:
         )
         return fig
     
-    def create_artists_count_metric(self):
-        """Sanatçı sayısı metriği"""
-        artists_count = self.performance_metrics.get('artists_count', 0)
-        
-        fig = go.Figure()
-        fig.add_trace(go.Indicator(
-            mode = "number",
-            value = artists_count,
-            title = {"text": "Benzersiz Sanatçı", "font": {"size": 14}},
-            number = {"font": {"size": 40, "color": "#1DB954"}}
-        ))
-        
-        fig.update_layout(height=200, margin=dict(l=20, r=20, t=40, b=20), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        return fig
-    
     def create_genre_trends_chart(self):
-        """Genre trend grafiği"""
         if not self.data_buffers['genre_trends']:
-            return go.Figure().add_annotation(text="Veri bekleniyor...", showarrow=False, font=dict(color="white"))
+            return go.Figure().add_annotation(text="Waiting for data...", showarrow=False, font=dict(color="white"))
         
-        # Son 5 dakika için genre analizi
         recent_time = datetime.now() - timedelta(minutes=5)
         recent_genres = [g for g in self.data_buffers['genre_trends'] if g['timestamp'] > recent_time]
         
         if not recent_genres:
-            return go.Figure().add_annotation(text="Son 5 dakikada veri yok", showarrow=False, font=dict(color="white"))
+            return go.Figure().add_annotation(text="No data in last 5 minutes", showarrow=False, font=dict(color="white"))
         
-        # Genre'lara göre grupla ve ortalama popülerlik hesapla
         genre_stats = defaultdict(lambda: {'count': 0, 'total_popularity': 0})
         for genre_data in recent_genres:
             genre = genre_data['genre']
@@ -454,28 +712,25 @@ class SpotifyDashboard:
         
         genres = []
         avg_popularities = []
-        counts = []
         
         for genre, stats in genre_stats.items():
             avg_popularity = stats['total_popularity'] / stats['count']
             genres.append(genre)
             avg_popularities.append(avg_popularity)
-            counts.append(stats['count'])
         
-        # Top 8 genre'yi göster
-        sorted_data = sorted(zip(genres, avg_popularities, counts), key=lambda x: x[1], reverse=True)[:8]
-        genres, avg_popularities, counts = zip(*sorted_data) if sorted_data else ([], [], [])
+        sorted_data = sorted(zip(genres, avg_popularities), key=lambda x: x[1], reverse=True)[:8]
+        genres, avg_popularities = zip(*sorted_data) if sorted_data else ([], [])
         
         fig = px.bar(
             x=genres,
             y=avg_popularities,
-            title="Genre Popülerlik Ortalaması (Son 5 Dakika)",
+            title="Genre Popularity Average (Last 5 Minutes)",
             color=avg_popularities,
             color_continuous_scale="viridis"
         )
         
         fig.update_layout(
-            height=300,
+            height=350,
             margin=dict(l=20, r=20, t=40, b=20),
             showlegend=False,
             paper_bgcolor='rgba(0,0,0,0)',
@@ -487,16 +742,14 @@ class SpotifyDashboard:
         return fig
     
     def create_popularity_timeline(self):
-        """Popularity timeline grafiği"""
         if not self.data_buffers['popularity_timeline']:
-            return go.Figure().add_annotation(text="Veri bekleniyor...", showarrow=False, font=dict(color="white"))
+            return go.Figure().add_annotation(text="Waiting for data...", showarrow=False, font=dict(color="white"))
         
-        # Son 10 dakika
         recent_time = datetime.now() - timedelta(minutes=10)
         recent_timeline = [t for t in self.data_buffers['popularity_timeline'] if t['timestamp'] > recent_time]
         
         if not recent_timeline:
-            return go.Figure().add_annotation(text="Son 10 dakikada veri yok", showarrow=False, font=dict(color="white"))
+            return go.Figure().add_annotation(text="No data in last 10 minutes", showarrow=False, font=dict(color="white"))
         
         df = pd.DataFrame(recent_timeline)
         
@@ -505,12 +758,12 @@ class SpotifyDashboard:
             x='timestamp', 
             y='popularity',
             color='genre',
-            title="Popülerlik Zaman Çizelgesi (Son 10 Dakika)",
+            title="Popularity Timeline (Last 10 Minutes)",
             hover_data=['artist', 'title', 'year']
         )
         
         fig.update_layout(
-            height=300, 
+            height=350, 
             margin=dict(l=20, r=20, t=40, b=20),
             paper_bgcolor='rgba(0,0,0,0)',
             plot_bgcolor='rgba(0,0,0,0)',
@@ -520,11 +773,10 @@ class SpotifyDashboard:
         return fig
     
     def create_audio_features_radar(self):
-        """Audio features radar grafiği"""
         if not self.data_buffers['audio_features']:
-            return go.Figure().add_annotation(text="Veri bekleniyor...", showarrow=False, font=dict(color="white"))
+            return go.Figure().add_annotation(text="Waiting for data...", showarrow=False, font=dict(color="white"))
         
-        recent_features = list(self.data_buffers['audio_features'])[-30:]  # Son 30 şarkı
+        recent_features = list(self.data_buffers['audio_features'])[-30:]
         avg_features = {
             'Energy': np.mean([f['energy'] for f in recent_features]),
             'Danceability': np.mean([f['danceability'] for f in recent_features]),
@@ -538,7 +790,7 @@ class SpotifyDashboard:
             r=list(avg_features.values()),
             theta=list(avg_features.keys()),
             fill='toself',
-            name='Ortalama Audio Features',
+            name='Average Audio Features',
             line_color='#1DB954'
         ))
         
@@ -552,8 +804,8 @@ class SpotifyDashboard:
                 angularaxis=dict(color="white")
             ),
             showlegend=True,
-            title="Audio Features Profili (Son 30 Şarkı)",
-            height=300,
+            title="Audio Features Profile (Last 30 Songs)",
+            height=350,
             margin=dict(l=20, r=20, t=40, b=20),
             paper_bgcolor='rgba(0,0,0,0)',
             plot_bgcolor='rgba(0,0,0,0)',
@@ -564,16 +816,14 @@ class SpotifyDashboard:
         return fig
     
     def create_real_time_events_chart(self):
-        """Real-time events grafiği"""
         if not self.data_buffers['real_time_events']:
-            return go.Figure().add_annotation(text="Real-time event bekleniyor...", showarrow=False, font=dict(color="white"))
+            return go.Figure().add_annotation(text="Waiting for real-time events...", showarrow=False, font=dict(color="white"))
         
         events = list(self.data_buffers['real_time_events'])[-15:]
         
         if not events:
-            return go.Figure().add_annotation(text="Henüz real-time event yok", showarrow=False, font=dict(color="white"))
+            return go.Figure().add_annotation(text="No real-time events yet", showarrow=False, font=dict(color="white"))
         
-        # Event'leri timeline olarak göster
         event_data = []
         for event in events:
             song_title = event['song'].get('title', 'Unknown')
@@ -602,7 +852,7 @@ class SpotifyDashboard:
         )
         
         fig.update_layout(
-            height=300,
+            height=350,
             margin=dict(l=20, r=20, t=40, b=20),
             showlegend=True,
             paper_bgcolor='rgba(0,0,0,0)',
@@ -614,73 +864,33 @@ class SpotifyDashboard:
         
         return fig
     
-    def create_year_genre_heatmap(self):
-        """Yıl-Genre heatmap"""
-        if len(self.data_buffers['popularity_timeline']) < 20:
-            return go.Figure().add_annotation(text="Yeterli veri yok", showarrow=False, font=dict(color="white"))
-        
-        # Son veriyi al
-        recent_data = list(self.data_buffers['popularity_timeline'])[-200:]
-        df = pd.DataFrame(recent_data)
-        
-        # Yıl ve genre'ye göre ortalama popülerlik hesapla
-        year_genre_stats = df.groupby(['year', 'genre'])['popularity'].mean().reset_index()
-        
-        if year_genre_stats.empty:
-            return go.Figure().add_annotation(text="Heatmap için veri yok", showarrow=False, font=dict(color="white"))
-        
-        # Pivot table oluştur
-        pivot_df = year_genre_stats.pivot(index='genre', columns='year', values='popularity')
-        pivot_df = pivot_df.fillna(0)
-        
-        fig = px.imshow(
-            pivot_df,
-            title="Yıl-Genre Popülerlik Haritası",
-            color_continuous_scale="viridis",
-            aspect="auto"
-        )
-        
-        fig.update_layout(
-            height=400,
-            margin=dict(l=20, r=20, t=40, b=20),
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            font=dict(color="white"),
-            title_font_color="white"
-        )
-        
-        return fig
-    
     def create_performance_metrics(self):
-        """Performance metrics HTML"""
         metrics = self.performance_metrics
-        uptime = (datetime.now() - metrics['start_time']).total_seconds()
         
         return html.Div([
-            html.Span(f"İşlenen: {metrics['messages_processed']}", className="metric"),
-            html.Span(f"Hız: {metrics['processing_rate']:.1f} msg/sec", className="metric"),
-            html.Span(f"Uptime: {uptime:.0f}s", className="metric"),
+            html.Span(f"Processed: {metrics['messages_processed']}", className="metric"),
+            html.Span(f"Rate: {metrics['processing_rate']:.1f} msg/sec", className="metric"),
             html.Span(f"Genres: {metrics['genres_count']}", className="metric"),
-            html.Span(f"Artists: {metrics['artists_count']}", className="metric")
+            html.Span(f"Timeless: {metrics['timeless_analysis_count']}", className="metric"),
+            html.Span(f"Active Events: {metrics['active_events']}", className="metric"),
+            html.Span(f"Rollbacks: {metrics['rollback_events']}", className="metric")
         ])
     
     def run(self, host='127.0.0.1', port=8050, debug=False):
-        """Dashboard'u başlat"""
-        logger.info(f"🚀 Spotify Dashboard başlatılıyor: http://{host}:{port}")
+        logger.info(f"Spotify Dashboard starting: http://{host}:{port}")
         
-        # Custom CSS ekle
         self.app.index_string = '''
         <!DOCTYPE html>
         <html>
             <head>
                 {%metas%}
-                <title>Spotify Analytics Dashboard</title>
+                <title>Spotify Timeless Analytics Dashboard</title>
                 {%favicon%}
                 {%css%}
                 <style>
                     body { 
                         margin: 0; 
-                        font-family: "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif; 
+                        font-family: "Inter", sans-serif; 
                         background: linear-gradient(135deg, #0d1117 0%, #161b22 100%);
                         color: white; 
                         min-height: 100vh;
@@ -699,11 +909,22 @@ class SpotifyDashboard:
                         font-weight: 700;
                         font-size: 28px;
                     }
+                    .status-indicators {
+                        display: flex;
+                        flex-direction: column;
+                        gap: 5px;
+                        align-items: center;
+                    }
                     .live-indicator { 
                         color: #ff4444; 
                         font-weight: bold; 
                         font-size: 18px;
                         animation: pulse 2s infinite;
+                    }
+                    .timeless-indicator {
+                        color: #FFD700;
+                        font-weight: bold;
+                        font-size: 14px;
                     }
                     @keyframes pulse {
                         0% { opacity: 1; }
@@ -721,7 +942,6 @@ class SpotifyDashboard:
                         border-radius: 20px;
                         font-size: 14px;
                         font-weight: 500;
-                        backdrop-filter: blur(10px);
                     }
                     .main-container { 
                         padding: 30px; 
@@ -739,7 +959,6 @@ class SpotifyDashboard:
                         background: rgba(255,255,255,0.05); 
                         border-radius: 16px; 
                         padding: 20px;
-                        backdrop-filter: blur(10px);
                         border: 1px solid rgba(255,255,255,0.1);
                         min-width: 200px;
                     }
@@ -748,7 +967,6 @@ class SpotifyDashboard:
                         background: rgba(255,255,255,0.05); 
                         border-radius: 16px; 
                         padding: 20px;
-                        backdrop-filter: blur(10px);
                         border: 1px solid rgba(255,255,255,0.1);
                         min-width: 400px;
                     }
@@ -757,11 +975,9 @@ class SpotifyDashboard:
                         background: rgba(255,255,255,0.05); 
                         border-radius: 16px; 
                         padding: 20px;
-                        backdrop-filter: blur(10px);
                         border: 1px solid rgba(255,255,255,0.1);
                     }
                     
-                    /* Mobile Responsive */
                     @media (max-width: 768px) {
                         .metrics-row, .charts-row {
                             flex-direction: column;
@@ -793,30 +1009,29 @@ class SpotifyDashboard:
         self.app.run_server(host=host, port=port, debug=debug)
     
     def stop(self):
-        """Dashboard'u durdur"""
         self.running = False
         if hasattr(self, 'consumer'):
             self.consumer.close()
 
-# Kullanım
 if __name__ == "__main__":
-    print("🎵" + "="*60 + "🎵")
-    print("    📊 SPOTIFY REAL-TIME ANALYTICS DASHBOARD 📊    ")
-    print("🎵" + "="*60 + "🎵")
-    print()
+    print("SPOTIFY TIMELESS ANALYTICS DASHBOARD")
+    print("=" * 50)
     
     dashboard = SpotifyDashboard()
     
     try:
-        print("✅ Dashboard başlatılıyor...")
-        print("🔗 URL: http://localhost:8050")
-        print("📊 Real-time grafikler yükleniyor...")
-        print("⏹️  Durdurmak için Ctrl+C'ye basın")
-        print("-" * 60)
+        print("Dashboard starting...")
+        print("URL: http://localhost:8050")
+        print("Real-time + Timeless charts loading...")
+        print("Timeless genre analysis active...")
+        print("TIMEOUT SYSTEM: 30s auto-rollback tracking")
+        print("Event success rate and volatility monitoring")
+        print("Press Ctrl+C to stop")
+        print("-" * 50)
         
         dashboard.run(debug=False)
     except KeyboardInterrupt:
-        logger.info("🛑 Dashboard kapatılıyor...")
+        logger.info("Dashboard closing...")
     finally:
         dashboard.stop()
-        logger.info("👋 Dashboard kapatıldı!")
+        logger.info("Dashboard closed!")
