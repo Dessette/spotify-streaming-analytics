@@ -27,17 +27,17 @@ class SparkTimelessGenreAnalyzer:
         }
         
         # STRICT ANALYSIS PARAMETERS
-        self.analysis_year_start = 1960  # Fixed start
-        self.analysis_year_end = 2024    # Fixed end  
+        self.analysis_year_start = 1900  # Fixed start
+        self.analysis_year_end = 2030    # Fixed end  
         self.total_analysis_years = self.analysis_year_end - self.analysis_year_start + 1  # 65 years
         
         # Period configurations
         self.decade_length = 10  # Fixed 10-year decades
-        self.max_possible_decades = self.total_analysis_years // self.decade_length  # 6-7 decades max
+        self.max_possible_decades = self.total_analysis_years // (self.decade_length/2)  # 6-7 decades max
         
         # Minimum requirements (STRICT)
         self.min_songs_per_decade = 10   # Higher threshold
-        self.min_decades_for_timeless = 3  # Must span at least 3 decades
+        self.min_decades_for_timeless = 2  # Must span at least 3 decades
         self.min_total_songs = 50          # Minimum total songs
         
         logger.info(f"Initialized STRICT timeless analysis:")

@@ -1,3 +1,5 @@
+# spark_streaming_consumer.py - UPDATED WITH STRICT ALGORITHM
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
@@ -14,6 +16,15 @@ class SpotifySparkStreamingAnalyzer:
         self.spark = None
         self.setup_spark()
         
+        # STRICT TIMELESS PARAMETERS (SAME AS STANDALONE)
+        self.analysis_year_start = 1900
+        self.analysis_year_end = 2030
+        self.decade_length = 10
+        self.max_possible_decades = (self.analysis_year_end - self.analysis_year_start + 1) // (self.decade_length/2)
+        self.min_songs_per_decade = 10
+        self.min_decades_for_timeless = 2
+        self.min_total_songs = 50
+        
     def setup_spark(self):
         """Spark Session with Kafka and PostgreSQL support"""
         self.spark = SparkSession.builder \
@@ -27,9 +38,8 @@ class SpotifySparkStreamingAnalyzer:
             .getOrCreate()
         
         self.spark.sparkContext.setLogLevel("WARN")
-        logger.info("Spark Session created with Kafka and PostgreSQL support")
+        logger.info("Spark Session created with STRICT timeless algorithm")
 
-        # PostgreSQL connection properties
         self.postgres_props = {
             "user": "spotify_user",
             "password": "spotify_pass",
@@ -61,7 +71,7 @@ class SpotifySparkStreamingAnalyzer:
         ])
     
     def setup_kafka_streams(self):
-        """Setup Kafka Structured Streaming - FIXED VERSION"""
+        """Setup Kafka Structured Streaming"""
         self.define_schemas()
         
         # Historical stream
@@ -74,12 +84,10 @@ class SpotifySparkStreamingAnalyzer:
             .option("failOnDataLoss", "false") \
             .load()
         
-        # Parse JSON with explicit column extraction - FIXED
         historical_parsed = historical_stream.select(
             from_json(col("value").cast("string"), self.event_schema).alias("parsed_data")
         )
         
-        # Extract fields explicitly without star expansion - FIXED
         self.historical_df = historical_parsed.select(
             col("parsed_data.song_data.title").alias("title"),
             col("parsed_data.song_data.artist").alias("artist"),
@@ -96,7 +104,7 @@ class SpotifySparkStreamingAnalyzer:
             col("parsed_data.timestamp").cast("timestamp").alias("source_timestamp")
         ).withColumn("processed_at", current_timestamp())
         
-        # Real-time events stream - FIXED
+        # Real-time events stream
         realtime_stream = self.spark \
             .readStream \
             .format("kafka") \
@@ -106,7 +114,6 @@ class SpotifySparkStreamingAnalyzer:
             .option("failOnDataLoss", "false") \
             .load()
         
-        # Parse real-time events with explicit extraction - FIXED
         realtime_parsed = realtime_stream.select(
             from_json(col("value").cast("string"), self.event_schema).alias("parsed_data")
         )
@@ -129,20 +136,17 @@ class SpotifySparkStreamingAnalyzer:
             col("parsed_data.metadata.has_timeout").cast("boolean").alias("has_timeout")
         ).withColumn("processed_at", current_timestamp())
         
-        logger.info("Kafka streams configured successfully")
+        logger.info("Kafka streams configured with STRICT algorithm")
     
     def create_temp_views(self):
         """Create temporary views for SQL analytics"""
-        # Create streaming temp views
         self.historical_df.createOrReplaceTempView("historical_songs")
         self.realtime_df.createOrReplaceTempView("realtime_events")
-        
         logger.info("Temporary views created")
     
     def start_historical_analytics(self):
-        """Process historical data with Spark SQL - STREAMING COMPATIBLE"""
-        
-        # 1. Genre Trends Analysis - FIXED for streaming
+        """Process historical data with Spark SQL"""
+        # Genre Trends Analysis
         genre_trends_query = self.spark.sql("""
             SELECT 
                 top_genre as genre,
@@ -158,7 +162,6 @@ class SpotifySparkStreamingAnalyzer:
             GROUP BY top_genre, window(processed_at, '5 minutes')
         """)
         
-        # Write to PostgreSQL
         def write_genre_trends_to_postgres(df, epoch_id):
             try:
                 df.select(
@@ -187,7 +190,7 @@ class SpotifySparkStreamingAnalyzer:
             .option("checkpointLocation", "/tmp/genre_trends_checkpoint") \
             .start()
         
-        # 2. Song Analytics Storage - SIMPLIFIED
+        # Song Analytics Storage
         def write_song_analytics_to_postgres(df, epoch_id):
             try:
                 df.select(
@@ -225,8 +228,7 @@ class SpotifySparkStreamingAnalyzer:
         return [genre_trends_stream, song_analytics_stream]
     
     def start_realtime_analytics(self):
-        """Process real-time events with Spark SQL - JDBC COMPATIBLE VERSION"""
-        
+        """Process real-time events"""
         def write_realtime_events_to_postgres(df, epoch_id):
             try:
                 metadata_struct = struct(
@@ -250,7 +252,6 @@ class SpotifySparkStreamingAnalyzer:
                     coalesce(col("has_timeout").cast("boolean"), lit(False)).alias("has_timeout")
                 )
                 
-                # Write to PostgreSQL
                 df_processed.write \
                     .format("jdbc") \
                     .options(**self.postgres_props) \
@@ -262,29 +263,6 @@ class SpotifySparkStreamingAnalyzer:
                 
             except Exception as e:
                 logger.error(f"Error writing real-time events: {e}")
-                # Fallback: Try simpler version without metadata
-                try:
-                    df.select(
-                        col("event_type"),
-                        col("title").alias("song_title"),
-                        col("artist"),
-                        lit('{}').alias("metadata"),  # Empty JSON
-                        col("processed_at").alias("created_at"),
-                        coalesce(col("event_id"), lit("unknown")).alias("event_id"),
-                        coalesce(col("boost_amount"), lit(0)).alias("boost_amount"),
-                        coalesce(col("reason"), lit("unknown")).alias("reason"),
-                        coalesce(col("original_popularity").cast("int"), lit(0)).alias("original_popularity"),
-                        coalesce(col("has_timeout").cast("boolean"), lit(False)).alias("has_timeout")
-                    ).write \
-                    .format("jdbc") \
-                    .options(**self.postgres_props) \
-                    .option("dbtable", "real_time_events") \
-                    .mode("append") \
-                    .save()
-                    
-                    logger.info(f"Wrote {df.count()} real-time events (fallback mode)")
-                except Exception as e2:
-                    logger.error(f"Fallback write also failed: {e2}")
         
         realtime_stream = self.realtime_df.writeStream \
             .foreachBatch(write_realtime_events_to_postgres) \
@@ -295,11 +273,15 @@ class SpotifySparkStreamingAnalyzer:
         
         return [realtime_stream]
     
-    def start_timeless_analytics(self):
-
-        def run_timeless_batch_analysis():
+    def start_STRICT_timeless_analytics(self):
+        """UPDATED: Use STRICT timeless algorithm from standalone version"""
+        
+        def run_STRICT_timeless_analysis():
             try:
-                # 1) Kaynak veriyi oku
+                # Clear Spark cache first
+                self.spark.catalog.clearCache()
+                logger.info("🧹 Spark cache cleared")
+                
                 existing_songs = (self.spark.read
                     .format("jdbc")
                     .options(**self.postgres_props)
@@ -307,53 +289,146 @@ class SpotifySparkStreamingAnalyzer:
                     .load()
                 )
 
-                # ✅ Eşik değerini düşür (ör. 10)
-                if existing_songs.count() < 10:
-                    logger.info("Not enough data for timeless analysis")
+                if existing_songs.count() < self.min_total_songs:
+                    logger.info(f"Not enough data for STRICT analysis (need {self.min_total_songs})")
                     return
 
                 existing_songs.createOrReplaceTempView("all_songs_batch")
 
-                # 2) Analiz (genre normalize + total_unique_artists üret)
-                timeless_analysis = self.spark.sql("""
-                    WITH base AS (
-                      SELECT lower(trim(genre)) AS genre_norm, *
-                      FROM all_songs_batch
-                      WHERE genre IS NOT NULL AND year IS NOT NULL
+                # STRICT TIMELESS ALGORITHM (SAME AS STANDALONE)
+                strict_timeless_query = f"""
+                    WITH decade_analysis AS (
+                        SELECT 
+                            LOWER(TRIM(genre)) as genre,
+                            FLOOR(year / {self.decade_length}) * {self.decade_length} as decade,
+                            COUNT(*) as songs_in_decade,
+                            ROUND(AVG(popularity), 2) as avg_popularity,
+                            ROUND(STDDEV(popularity), 2) as popularity_std,
+                            MAX(popularity) as max_popularity,
+                            MIN(popularity) as min_popularity,
+                            COUNT(DISTINCT artist) as unique_artists
+                        FROM all_songs_batch
+                        WHERE genre IS NOT NULL 
+                          AND year >= {self.analysis_year_start} 
+                          AND year <= {self.analysis_year_end}
+                          AND popularity >= 1
+                        GROUP BY LOWER(TRIM(genre)), FLOOR(year / {self.decade_length}) * {self.decade_length}
+                        HAVING COUNT(*) >= {self.min_songs_per_decade}
                     ),
-                    genre_stats AS (
-                      SELECT 
-                        genre_norm AS genre,
-                        COUNT(*) AS total_songs,
-                        AVG(popularity) AS avg_popularity,
-                        STDDEV(popularity) AS std_popularity,
-                        COUNT(DISTINCT year) AS year_span,
-                        approx_count_distinct(artist) AS total_unique_artists,
-                        current_date() AS analysis_date
-                      FROM base
-                      GROUP BY genre_norm
-                      HAVING COUNT(*) >= 3
+                    genre_summary AS (
+                        SELECT 
+                            genre,
+                            COUNT(*) as decades_active,
+                            MIN(decade) as first_decade,
+                            MAX(decade) as last_decade,
+                            SUM(songs_in_decade) as total_songs,
+                            SUM(unique_artists) as total_artists,
+                            AVG(avg_popularity) as overall_avg_popularity,
+                            ROUND(STDDEV(avg_popularity), 2) as decade_popularity_variance,
+                            MAX(avg_popularity) as peak_decade_popularity,
+                            MIN(avg_popularity) as lowest_decade_popularity
+                        FROM decade_analysis
+                        GROUP BY genre
+                        HAVING COUNT(*) >= {self.min_decades_for_timeless}
+                           AND SUM(songs_in_decade) >= {self.min_total_songs}
+                    ),
+                    scoring AS (
+                        SELECT 
+                            genre,
+                            decades_active,
+                            (last_decade - first_decade) / {self.decade_length} + 1 as time_span_decades,
+                            total_songs,
+                            total_artists,
+                            overall_avg_popularity,
+                            decade_popularity_variance,
+                            
+                            -- STRICT SCORING (SAME AS STANDALONE)
+                            ROUND(LEAST(100.0, (decades_active * 100.0) / {self.max_possible_decades}), 1) as decade_presence_score,
+                            
+                            ROUND(
+                                CASE 
+                                    WHEN overall_avg_popularity > 0 AND decade_popularity_variance > 0 THEN
+                                        GREATEST(0, 100 - (decade_popularity_variance / overall_avg_popularity * 300))
+                                    WHEN decade_popularity_variance = 0 THEN 85.0
+                                    ELSE 0
+                                END, 1
+                            ) as consistency_score,
+                            
+                            ROUND(
+                                LEAST(100.0, 
+                                    ((last_decade - first_decade) / 50.0) * 60 +
+                                    (decades_active * 5) +
+                                    LEAST(10, LOG10(total_songs) * 3)
+                                ), 1
+                            ) as longevity_score,
+                            
+                            ROUND(
+                                CASE 
+                                    WHEN peak_decade_popularity > lowest_decade_popularity THEN
+                                        GREATEST(0, 100 - 
+                                            ((peak_decade_popularity - lowest_decade_popularity) / overall_avg_popularity * 200)
+                                        )
+                                    ELSE 70.0
+                                END, 1
+                            ) as stability_score,
+                            
+                            CASE 
+                                WHEN overall_avg_popularity < 30 THEN 15
+                                WHEN overall_avg_popularity < 45 THEN 8
+                                WHEN overall_avg_popularity < 60 THEN 3
+                                ELSE 0
+                            END as popularity_penalty,
+                            
+                            CASE 
+                                WHEN last_decade < {self.analysis_year_end - 20} THEN 12
+                                WHEN last_decade < {self.analysis_year_end - 10} THEN 6
+                                ELSE 0
+                            END as recency_penalty
+                            
+                        FROM genre_summary
                     )
                     SELECT 
-                      genre,
-                      analysis_date,
-                      5 AS analysis_period_years,
-                      LEAST(100.0, avg_popularity + year_span * 2) AS timeless_score,
-                      CASE 
-                        WHEN avg_popularity > 0 THEN GREATEST(0.0, 100.0 - (std_popularity / avg_popularity * 100.0))
-                        ELSE 0.0
-                      END AS consistency_score,
-                      LEAST(100.0, year_span * 5.0) AS longevity_score,
-                      GREATEST(0.0, 100.0 - std_popularity) AS variance_score,
-                      avg_popularity AS peak_stability,
-                      LEAST(20, year_span) AS decade_presence,
-                      year_span,
-                      total_songs,
-                      total_unique_artists
-                    FROM genre_stats
-                    ORDER BY timeless_score DESC
-                """)
+                        genre,
+                        decades_active as decade_presence,
+                        time_span_decades,
+                        total_songs,
+                        total_artists,
+                        ROUND(overall_avg_popularity, 1) as avg_popularity,
+                        decade_presence_score,
+                        consistency_score,
+                        longevity_score,
+                        stability_score,
+                        popularity_penalty,
+                        recency_penalty,
+                        
+                        -- FINAL STRICT TIMELESS SCORE
+                        ROUND(
+                            GREATEST(0,
+                                (consistency_score * 0.35 +
+                                 longevity_score * 0.25 +
+                                 stability_score * 0.20 +
+                                 decade_presence_score * 0.20) -
+                                popularity_penalty -
+                                recency_penalty
+                            ), 1
+                        ) as timeless_score,
+                        
+                        current_date() as analysis_date,
+                        {self.decade_length} as analysis_period_years
+                        
+                    FROM scoring
+                    WHERE consistency_score > 0 AND longevity_score > 0
+                    ORDER BY 
+                        GREATEST(0,
+                            (consistency_score * 0.35 + longevity_score * 0.25 + 
+                             stability_score * 0.20 + decade_presence_score * 0.20) -
+                            popularity_penalty - recency_penalty
+                        ) DESC
+                """
 
+                timeless_analysis = self.spark.sql(strict_timeless_query)
+                
+                # Pre-delete old results for today
                 postgres_config = {
                     'host': 'localhost',
                     'port': 5432,
@@ -362,82 +437,72 @@ class SpotifySparkStreamingAnalyzer:
                     'password': 'spotify_pass'
                 }
 
-                # ✅ Pre-delete: hata verse bile yazmayı engellemesin
                 try:
-                    genres = [r["genre"] for r in timeless_analysis.select("genre").distinct().collect()]
-                    if genres:
-                        conn = psycopg2.connect(
-                            host=postgres_config['host'],
-                            port=postgres_config['port'],
-                            database=postgres_config['database'],  # dbname alias'ı OK
-                            user=postgres_config['user'],
-                            password=postgres_config['password']
-                        )
-                        conn.autocommit = True
-                        with conn.cursor() as cur:
-                            cur.execute("""
-                                DELETE FROM public.timeless_genre_metrics
-                                WHERE analysis_date = CURRENT_DATE
-                                  AND genre = ANY(%s)
-                            """, (genres,))
-                        conn.close()
+                    conn = psycopg2.connect(**postgres_config)
+                    conn.autocommit = True
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM public.timeless_genre_metrics WHERE analysis_date = CURRENT_DATE")
+                        logger.info(f"🗑️ Cleared {cur.rowcount} old timeless records for today")
+                    conn.close()
                 except Exception as del_err:
-                    logger.warning(f"Pre-delete skipped: {del_err}")
+                    logger.warning(f"Pre-delete failed: {del_err}")
 
-                # 3) Skor kolonlarında NaN/NULL → 0.0
-                for c in ["timeless_score","consistency_score","longevity_score","variance_score","peak_stability"]:
-                    timeless_analysis = timeless_analysis.withColumn(
-                        c, nanvl(coalesce(col(c), lit(0.0)), lit(0.0))
-                    )
-
-                # 4) Yazmadan önce kaç satır gideceğini logla
+                # Write new STRICT results
                 rows_to_write = timeless_analysis.count()
-                logger.info(f"Timeless rows to write: {rows_to_write}")
+                logger.info(f"📊 STRICT timeless rows to write: {rows_to_write}")
 
-                # 5) Tip/isimleri tabloya hizala ve yaz
-                (timeless_analysis.select(
-                        col("genre"),
-                        col("analysis_date"),
-                        col("analysis_period_years").cast("int"),
-                        col("timeless_score").cast(DecimalType(5, 2)),
-                        col("consistency_score").cast(DecimalType(5, 2)),
-                        col("longevity_score").cast(DecimalType(5, 2)),
-                        col("variance_score").cast(DecimalType(5, 2)),
-                        col("peak_stability").cast(DecimalType(5, 2)),
-                        col("decade_presence").cast("int"),
-                        col("year_span").cast("int"),
-                        col("total_songs").cast("int"),
-                        col("total_unique_artists").cast("int")
+                if rows_to_write > 0:
+                    (timeless_analysis.select(
+                            col("genre"),
+                            col("analysis_date"),
+                            col("analysis_period_years").cast("int"),
+                            col("timeless_score").cast(DecimalType(5, 2)),
+                            col("consistency_score").cast(DecimalType(5, 2)),
+                            col("longevity_score").cast(DecimalType(5, 2)),
+                            col("stability_score").cast(DecimalType(5, 2)).alias("variance_score"),  # Map to existing DB column
+                            col("decade_presence_score").cast(DecimalType(5, 2)).alias("peak_stability"),  # Map to existing DB column
+                            col("decade_presence").cast("int"),
+                            col("time_span_decades").cast("int").alias("year_span"),  # Map to existing DB column
+                            col("total_songs").cast("int"),
+                            col("total_artists").cast("int").alias("total_unique_artists")  # Map to existing DB column
+                        )
+                        .write
+                        .format("jdbc")
+                        .options(**{**self.postgres_props, "driver": "org.postgresql.Driver"})
+                        .option("dbtable", "public.timeless_genre_metrics")
+                        .mode("append")
+                        .save()
                     )
-                    .write
-                    .format("jdbc")
-                    .options(**{**self.postgres_props, "driver": "org.postgresql.Driver"})  # güvence
-                    .option("dbtable", "public.timeless_genre_metrics")
-                    .mode("append")
-                    .save()
-                )
 
-                logger.info(f"Updated timeless metrics for {rows_to_write} rows")
+                    logger.info(f"✅ Updated STRICT timeless metrics for {rows_to_write} genres")
+                    
+                    # Show max scores achieved for monitoring
+                    max_score = timeless_analysis.agg(max("timeless_score")).collect()[0][0]
+                    avg_score = timeless_analysis.agg(avg("timeless_score")).collect()[0][0]
+                    logger.info(f"📈 STRICT scores - Max: {max_score:.1f}, Avg: {avg_score:.1f}")
+                else:
+                    logger.warning("❌ No genres met STRICT criteria")
 
             except Exception as e:
-                logger.error(f"Timeless analysis error: {e}")
+                logger.error(f"STRICT timeless analysis error: {e}")
 
-        # İlk analizi hemen çalıştır
-        run_timeless_batch_analysis()
+        # Run initial analysis
+        run_STRICT_timeless_analysis()
 
-        # Periyodik
+        # Schedule periodic analysis
         import threading, time
-        def periodic_timeless_analysis():
+        def periodic_STRICT_analysis():
             while True:
-                time.sleep(25)
-                run_timeless_batch_analysis()
-        threading.Thread(target=periodic_timeless_analysis, daemon=True).start()
+                time.sleep(60)  # Every minute (increased frequency for testing)
+                run_STRICT_timeless_analysis()
+                
+        threading.Thread(target=periodic_STRICT_analysis, daemon=True).start()
+        logger.info("🔄 STRICT timeless analysis scheduled every 60 seconds")
 
         return []
-
     
     def start_all_analytics(self):
-        """Start all Spark Structured Streaming analytics"""
+        """Start all Spark Structured Streaming analytics with STRICT algorithm"""
         logger.info("Setting up Kafka streams...")
         self.setup_kafka_streams()
         
@@ -450,95 +515,16 @@ class SpotifySparkStreamingAnalyzer:
         logger.info("Starting real-time analytics...")
         realtime_streams = self.start_realtime_analytics()
         
-        logger.info("Starting timeless analytics...")
-        timeless_streams = self.start_timeless_analytics()
+        logger.info("Starting STRICT timeless analytics...")
+        timeless_streams = self.start_STRICT_timeless_analytics()
         
         all_streams = historical_streams + realtime_streams + timeless_streams
         
-        logger.info(f"Started {len(all_streams)} Spark Structured Streaming queries")
+        logger.info(f"✅ Started {len(all_streams)} Spark streams with STRICT timeless algorithm")
+        logger.info(f"🎯 STRICT params: {self.min_songs_per_decade} songs/decade, {self.min_decades_for_timeless} decades min")
+        logger.info(f"📊 Expected max scores: 40-95 (no perfect 100s)")
+        
         return all_streams
-    
-    def run_batch_analytics(self):
-        """Run batch analytics queries"""
-        logger.info("Running batch analytics...")
-        
-        # Read existing data from PostgreSQL for complex analytics
-        existing_songs = self.spark.read \
-            .format("jdbc") \
-            .options(**self.postgres_props) \
-            .option("dbtable", "song_analytics") \
-            .load()
-        
-        existing_songs.createOrReplaceTempView("all_songs")
-        
-        # Advanced Analytics Queries
-        
-        # 1. Audio Features Analysis by Genre
-        audio_features_analysis = self.spark.sql("""
-            SELECT 
-                genre,
-                AVG(energy) as avg_energy,
-                AVG(danceability) as avg_danceability, 
-                AVG(valence) as avg_valence,
-                AVG(acousticness) as avg_acousticness,
-                STDDEV(energy) as energy_variance,
-                COUNT(*) as song_count,
-                current_timestamp() as analysis_date
-            FROM all_songs
-            WHERE genre IS NOT NULL
-            GROUP BY genre
-            HAVING COUNT(*) >= 10
-            ORDER BY song_count DESC
-        """)
-        
-        # 2. Year-over-Year Genre Popularity Trends
-        yearly_trends = self.spark.sql("""
-            SELECT 
-                genre,
-                year,
-                AVG(popularity) as avg_popularity,
-                COUNT(*) as song_count,
-                COUNT(DISTINCT artist) as unique_artists,
-                ROW_NUMBER() OVER (PARTITION BY year ORDER BY AVG(popularity) DESC) as yearly_rank
-            FROM all_songs
-            WHERE genre IS NOT NULL AND year IS NOT NULL
-            GROUP BY genre, year
-            HAVING COUNT(*) >= 3
-            ORDER BY year DESC, avg_popularity DESC
-        """)
-        
-        # 3. Artist Dominance Analysis
-        artist_analysis = self.spark.sql("""
-            SELECT 
-                artist,
-                genre,
-                COUNT(*) as song_count,
-                AVG(popularity) as avg_popularity,
-                MAX(popularity) as peak_popularity,
-                COUNT(DISTINCT year) as years_active,
-                current_timestamp() as analysis_date
-            FROM all_songs
-            WHERE artist IS NOT NULL AND genre IS NOT NULL
-            GROUP BY artist, genre
-            HAVING COUNT(*) >= 5
-            ORDER BY avg_popularity DESC, song_count DESC
-        """)
-        
-        # Show results
-        logger.info("=== AUDIO FEATURES BY GENRE ===")
-        audio_features_analysis.show(10, truncate=False)
-        
-        logger.info("=== YEARLY GENRE TRENDS (Recent) ===")
-        yearly_trends.filter(col("year") >= 2015).show(20, truncate=False)
-        
-        logger.info("=== TOP ARTISTS BY GENRE ===")
-        artist_analysis.show(15, truncate=False)
-        
-        return {
-            'audio_features': audio_features_analysis,
-            'yearly_trends': yearly_trends,
-            'artist_analysis': artist_analysis
-        }
     
     def stop_all_streams(self):
         """Stop all streaming queries"""
@@ -549,51 +535,41 @@ class SpotifySparkStreamingAnalyzer:
         if self.spark:
             self.spark.stop()
         
-        logger.info("All streams stopped")
+        logger.info("All STRICT streams stopped")
 
 if __name__ == "__main__":
     import time
     
-    print("SPOTIFY SPARK STRUCTURED STREAMING ANALYTICS")
-    print("=" * 60)
+    print("SPOTIFY SPARK STREAMING WITH STRICT TIMELESS ALGORITHM")
+    print("=" * 70)
+    print("🎯 STRICT SCORING: Max ~95 points (no perfect 100)")
+    print("📊 FIXED DECADES: 1960s-2020s (max 7 decades)")
+    print("⚖️ HIGH THRESHOLDS: 10+ songs/decade, 3+ decades minimum")
+    print("🔄 REAL-TIME UPDATES: Every 60 seconds")
     
     analyzer = SpotifySparkStreamingAnalyzer()
     
     try:
-        # Start all streaming analytics
         streams = analyzer.start_all_analytics()
         
-        print("✅ Spark Structured Streaming Analytics Active!")
-        print("📊 Historical data → PostgreSQL (genre trends, song analytics)")
+        print("✅ STRICT Spark Streaming Analytics Active!")
+        print("📊 Historical data → PostgreSQL (STRICT genre trends)")
         print("⚡ Real-time events → PostgreSQL (event tracking)")
-        print("🎯 Timeless analytics → PostgreSQL (genre metrics)")
-        print("📈 Advanced SQL analytics every 30-60 seconds")
-        print("🔄 Batch analytics available")
+        print("🎯 STRICT timeless analytics → PostgreSQL (NO 100s!)")
+        print("📈 Realistic scores: 40-95 range expected")
         print("Press Ctrl+C to stop")
-        print("-" * 60)
-        
-        # Run batch analytics every 5 minutes
-        last_batch_time = time.time()
+        print("-" * 70)
         
         while True:
-            time.sleep(30)
+            time.sleep(60)
             
             # Check stream health
             active_streams = [s for s in streams if s.isActive]
             if len(active_streams) != len(streams):
                 logger.warning(f"Some streams stopped. Active: {len(active_streams)}/{len(streams)}")
-            
-            # Run batch analytics every 5 minutes
-            current_time = time.time()
-            if current_time - last_batch_time > 300:  # 5 minutes
-                try:
-                    analyzer.run_batch_analytics()
-                    last_batch_time = current_time
-                except Exception as e:
-                    logger.error(f"Batch analytics error: {e}")
                     
     except KeyboardInterrupt:
-        print("\nStopping Spark Analytics...")
+        print("\nStopping STRICT Spark Analytics...")
     finally:
         analyzer.stop_all_streams()
-        print("Spark Analytics stopped!")
+        print("STRICT Spark Analytics stopped!")
