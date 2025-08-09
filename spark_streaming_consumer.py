@@ -1,624 +1,599 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, when, udf
+from pyspark.sql.functions import *
 from pyspark.sql.types import *
-from confluent_kafka import Consumer, KafkaError, Producer
-import json
+import psycopg2
 import logging
-import threading
-import time
-import pandas as pd
-from collections import deque, defaultdict
-from datetime import datetime, timedelta
-import traceback
-
-from timeless_genre_analytics import TimelessGenreAnalyzer
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class SpotifyStreamingAnalyzer:
+class SpotifySparkStreamingAnalyzer:
     def __init__(self, kafka_bootstrap_servers='localhost:9092'):
         self.kafka_servers = kafka_bootstrap_servers
         self.spark = None
-        self.running = True
-        
-        # Küçültülmüş buffer'lar
-        self.analytics_buffer = {
-            'genre_trends': deque(maxlen=100),
-            'popularity_trends': deque(maxlen=200),
-            'real_time_events': deque(maxlen=50),
-            'audio_features': deque(maxlen=150),
-            'artist_stats': deque(maxlen=100)
-        }
-        
-        # Timeout sistemi için active event tracking
-        self.active_real_time_events = {}  # event_id -> event_data
-        self.timeout_stats = {
-            'total_events': 0,
-            'active_events': 0,
-            'expired_events': 0,
-            'rollback_processed': 0
-        }
-        
-        self.timeless_analyzer = TimelessGenreAnalyzer(analysis_periods=[5, 10])
-        
-        self.metrics = {
-            'messages_processed': 0,
-            'last_update': datetime.now(),
-            'processing_rate': 0.0,
-            'start_time': datetime.now(),
-            'timeless_analyses': 0,
-            'timeless_last_update': None
-        }
-        
-        self.producer_config = {
-            'bootstrap.servers': self.kafka_servers,
-            'client.id': 'spotify-analytics-producer',
-            'compression.type': 'gzip'
-        }
-        self.producer = Producer(self.producer_config)
-        
         self.setup_spark()
-        self.setup_kafka_consumer()
         
     def setup_spark(self):
+        """Spark Session with Kafka and PostgreSQL support"""
         self.spark = SparkSession.builder \
             .appName("SpotifyTimelessAnalytics") \
             .config("spark.sql.adaptive.enabled", "true") \
             .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-            .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
-            .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
             .config("spark.sql.streaming.checkpointLocation", "/tmp/spark-checkpoint") \
+            .config("spark.jars.packages", 
+                   "org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.1,"
+                   "org.postgresql:postgresql:42.6.0") \
             .getOrCreate()
         
         self.spark.sparkContext.setLogLevel("WARN")
-        logger.info("Spark Session created")
-    
-    def setup_kafka_consumer(self):
-        self.consumer_config = {
-            'bootstrap.servers': self.kafka_servers,
-            'group.id': 'spotify-analytics-group',
-            'auto.offset.reset': 'latest',
-            'enable.auto.commit': True,
-            'session.timeout.ms': 30000,
-            'heartbeat.interval.ms': 10000
+        logger.info("Spark Session created with Kafka and PostgreSQL support")
+
+        # PostgreSQL connection properties
+        self.postgres_props = {
+            "user": "spotify_user",
+            "password": "spotify_pass",
+            "driver": "org.postgresql.Driver",
+            "url": "jdbc:postgresql://localhost:5432/spotify_analytics?stringtype=unspecified"
         }
+    
+    def define_schemas(self):
+        """Define schemas for incoming data"""
+        self.song_schema = StructType([
+            StructField("title", StringType(), True),
+            StructField("artist", StringType(), True),
+            StructField("top_genre", StringType(), True),
+            StructField("year", IntegerType(), True),
+            StructField("popularity", IntegerType(), True),
+            StructField("energy", IntegerType(), True),
+            StructField("danceability", IntegerType(), True),
+            StructField("valence", IntegerType(), True),
+            StructField("acousticness", IntegerType(), True),
+            StructField("bpm", IntegerType(), True),
+            StructField("length", IntegerType(), True)
+        ])
         
-        self.consumer = Consumer(self.consumer_config)
-        topics = ['spotify-historical-stream', 'spotify-realtime-events']
-        self.consumer.subscribe(topics)
+        self.event_schema = StructType([
+            StructField("event_type", StringType(), True),
+            StructField("timestamp", StringType(), True),
+            StructField("song_data", self.song_schema, True),
+            StructField("metadata", MapType(StringType(), StringType()), True)
+        ])
+    
+    def setup_kafka_streams(self):
+        """Setup Kafka Structured Streaming - FIXED VERSION"""
+        self.define_schemas()
         
-        logger.info(f"Kafka Consumer created: {topics}")
-    
-    def process_song_data_enhanced(self, message_data):
-        try:
-            song_data = message_data.get('song_data', {})
-            event_type = message_data.get('event_type', 'unknown')
-            timestamp = datetime.now()
-            
-            self.process_standard_analytics(song_data, event_type, timestamp)
-            self.timeless_analyzer.add_song_data(song_data)
-            
-            # Her 20 şarkıda bir timeless analizi (50'den azaltıldı)
-            if self.metrics['messages_processed'] % 20 == 0:
-                self.run_timeless_analysis()
-                
-        except Exception as e:
-            logger.error(f"Song data processing error: {e}")
-    
-    def process_standard_analytics(self, song_data, event_type, timestamp):
-        genre_data = {
-            'timestamp': timestamp,
-            'genre': song_data.get('top_genre', 'unknown'),
-            'popularity': song_data.get('popularity', 0),
-            'event_type': event_type
-        }
-        self.analytics_buffer['genre_trends'].append(genre_data)
+        # Historical stream
+        historical_stream = self.spark \
+            .readStream \
+            .format("kafka") \
+            .option("kafka.bootstrap.servers", self.kafka_servers) \
+            .option("subscribe", "spotify-historical-stream") \
+            .option("startingOffsets", "earliest") \
+            .option("failOnDataLoss", "false") \
+            .load()
         
-        audio_features = {
-            'timestamp': timestamp,
-            'energy': song_data.get('energy', 0),
-            'danceability': song_data.get('danceability', 0),
-            'valence': song_data.get('valence', 0),
-            'acousticness': song_data.get('acousticness', 0),
-            'genre': song_data.get('top_genre', 'unknown'),
-            'popularity': song_data.get('popularity', 0)
-        }
-        self.analytics_buffer['audio_features'].append(audio_features)
+        # Parse JSON with explicit column extraction - FIXED
+        historical_parsed = historical_stream.select(
+            from_json(col("value").cast("string"), self.event_schema).alias("parsed_data")
+        )
         
-        artist_data = {
-            'timestamp': timestamp,
-            'artist': song_data.get('artist', 'unknown'),
-            'popularity': song_data.get('popularity', 0),
-            'genre': song_data.get('top_genre', 'unknown'),
-            'year': song_data.get('year', 2000)
-        }
-        self.analytics_buffer['artist_stats'].append(artist_data)
+        # Extract fields explicitly without star expansion - FIXED
+        self.historical_df = historical_parsed.select(
+            col("parsed_data.song_data.title").alias("title"),
+            col("parsed_data.song_data.artist").alias("artist"),
+            col("parsed_data.song_data.top_genre").alias("top_genre"),
+            col("parsed_data.song_data.year").alias("year"),
+            col("parsed_data.song_data.popularity").alias("popularity"),
+            col("parsed_data.song_data.energy").alias("energy"),
+            col("parsed_data.song_data.danceability").alias("danceability"),
+            col("parsed_data.song_data.valence").alias("valence"),
+            col("parsed_data.song_data.acousticness").alias("acousticness"),
+            col("parsed_data.song_data.bpm").alias("bpm"),
+            col("parsed_data.song_data.length").alias("length"),
+            col("parsed_data.event_type").alias("event_type"),
+            col("parsed_data.timestamp").cast("timestamp").alias("source_timestamp")
+        ).withColumn("processed_at", current_timestamp())
         
-        popularity_data = {
-            'timestamp': timestamp,
-            'popularity': song_data.get('popularity', 0),
-            'title': song_data.get('title', 'unknown'),
-            'artist': song_data.get('artist', 'unknown'),
-            'genre': song_data.get('top_genre', 'unknown'),
-            'year': song_data.get('year', 2000),
-            'event_type': event_type
-        }
-        self.analytics_buffer['popularity_trends'].append(popularity_data)
-    
-    def run_timeless_analysis(self):
-        try:
-            results = self.timeless_analyzer.analyze_genre_timelessness()
-            
-            if results:
-                top_timeless = self.timeless_analyzer.get_top_timeless_genres(10)
-                summary = self.timeless_analyzer.get_analytics_summary()
-                trending_changes = self.timeless_analyzer.get_trending_timeless_changes()
-                
-                analytics_result = {
-                    'analysis_type': 'timeless_genre_analysis',
-                    'timestamp': datetime.now().isoformat(),
-                    'top_timeless_genres': [
-                        {
-                            'rank': i + 1,
-                            'genre': genre,
-                            'timeless_score': round(metric.timeless_score, 2),
-                            'consistency_score': round(metric.consistency_score, 2),
-                            'longevity_score': round(metric.longevity_score, 2),
-                            'decade_presence': metric.decade_presence,
-                            'peak_stability': round(metric.peak_stability, 2)
-                        }
-                        for i, (genre, metric) in enumerate(top_timeless)
-                    ],
-                    'summary_statistics': summary,
-                    'trending_changes': trending_changes,
-                    'analysis_metadata': {
-                        'total_genres_analyzed': len(results),
-                        'total_data_points': len(self.timeless_analyzer.genre_data_buffer),
-                        'analysis_periods_used': self.timeless_analyzer.analysis_periods
-                    }
-                }
-                
-                self.send_analytics_result(analytics_result)
-                
-                self.metrics['timeless_analyses'] += 1
-                self.metrics['timeless_last_update'] = datetime.now()
-                
-                # Sadece top 3 log
-                for i, (genre, metric) in enumerate(top_timeless[:3], 1):
-                    logger.info(f"Top {i}: {genre}: {metric.timeless_score:.1f}/100")
-                
-                if trending_changes:
-                    for change in trending_changes[:2]:
-                        logger.info(f"{change['genre']}: {change['change_text']}")
-                
-        except Exception as e:
-            logger.error(f"Timeless analysis error: {e}")
-    
-    def send_analytics_result(self, result):
-        try:
-            self.producer.produce(
-                topic='spotify-analytics-results',
-                key='timeless_analysis',
-                value=json.dumps(result, ensure_ascii=False).encode('utf-8')
-            )
-            self.producer.poll(0)
-            
-        except Exception as e:
-            logger.error(f"Analytics result send error: {e}")
-    
-    def process_real_time_event_enhanced(self, message_data):
-        try:
-            event_type = message_data.get('event_type', 'unknown')
-            
-            if event_type == 'timeout_rollback':
-                self.handle_timeout_rollback(message_data)
-            else:
-                self.handle_regular_real_time_event(message_data)
-                
-        except Exception as e:
-            logger.error(f"Real-time event processing error: {e}")
-    
-    def handle_regular_real_time_event(self, message_data):
-        """Normal real-time event'leri işle"""
-        try:
-            event_data = {
-                'timestamp': datetime.now(),
-                'event_type': message_data.get('event_type', 'unknown'),
-                'song_data': message_data.get('song_data', {}),
-                'metadata': message_data.get('metadata', {}),
-                'status': 'active'
-            }
-            
-            # Event ID varsa active event'lere ekle
-            event_id = event_data['metadata'].get('event_id')
-            if event_id and event_data['metadata'].get('has_timeout'):
-                self.active_real_time_events[event_id] = {
-                    'event_data': event_data,
-                    'song_data': event_data['song_data'],
-                    'created_time': datetime.now(),
-                    'status': 'active'
-                }
-                self.timeout_stats['total_events'] += 1
-                self.timeout_stats['active_events'] = len(self.active_real_time_events)
-            
-            self.analytics_buffer['real_time_events'].append(event_data)
-            self.analyze_real_time_impact(event_data)
-            
-            song_title = event_data['song_data'].get('title', 'Unknown')
-            artist = event_data['song_data'].get('artist', 'Unknown') 
-            reason = event_data['metadata'].get('reason', 'unknown')
-            boost = event_data['metadata'].get('boost_amount', 0)
-            event_short_id = event_id[:8] if event_id else 'no-id'
-            
-            logger.info(f"Real-time Event [{event_short_id}]: '{song_title}' by {artist} - {reason} (+{boost})")
-            
-        except Exception as e:
-            logger.error(f"Regular real-time event error: {e}")
-    
-    def handle_timeout_rollback(self, message_data):
-        """Timeout rollback event'lerini işle"""
-        try:
-            original_event_id = message_data.get('original_event_id')
-            rollback_song_data = message_data.get('song_data', {})
-            rollback_metadata = message_data.get('metadata', {})
-            
-            if original_event_id and original_event_id in self.active_real_time_events:
-                # Original event'i kapat
-                original_event = self.active_real_time_events.pop(original_event_id)
-                original_event['status'] = 'expired'
-                
-                # Rollback event'i oluştur
-                rollback_event = {
-                    'timestamp': datetime.now(),
-                    'event_type': 'timeout_rollback',
-                    'song_data': rollback_song_data,
-                    'metadata': rollback_metadata,
-                    'original_event_id': original_event_id,
-                    'status': 'rollback'
-                }
-                
-                self.analytics_buffer['real_time_events'].append(rollback_event)
-                
-                # Timeless analyzer'dan boosted veriyi çıkar, orijinal veriyi ekle
-                self.rollback_timeless_data(original_event['song_data'], rollback_song_data)
-                
-                # Stats güncelle
-                self.timeout_stats['expired_events'] += 1
-                self.timeout_stats['rollback_processed'] += 1
-                self.timeout_stats['active_events'] = len(self.active_real_time_events)
-                
-                song_title = rollback_song_data.get('title', 'Unknown')
-                artist = rollback_song_data.get('artist', 'Unknown')
-                original_boost = rollback_metadata.get('original_boost', 0)
-                event_short_id = original_event_id[:8]
-                
-                logger.info(f"ROLLBACK [{event_short_id}]: '{song_title}' by {artist} - boost {original_boost} expired")
-                
-        except Exception as e:
-            logger.error(f"Timeout rollback error: {e}")
-    
-    def rollback_timeless_data(self, boosted_song_data, original_song_data):
-        """Timeless analyzer'dan boosted veriyi çıkar, orijinal veriyi ekle"""
-        try:
-            # Bu işlem için timeless analyzer'ın buffer'ından boosted veriyi bul ve çıkar
-            buffer = self.timeless_analyzer.genre_data_buffer
-            
-            # Boosted şarkıyı bul ve çıkar (title + artist match)
-            boosted_title = boosted_song_data.get('title')
-            boosted_artist = boosted_song_data.get('artist')
-            
-            # Buffer'dan boosted versiyonu çıkar (son eklenen olması muhtemel)
-            for i in range(len(buffer) - 1, -1, -1):
-                song = buffer[i]
-                if (song.get('title') == boosted_title and 
-                    song.get('artist') == boosted_artist and
-                    song.get('event_type') in ['popularity_surge', 'historical']):
-                    # Boosted version'u kaldır
-                    del buffer[i]
-                    break
-            
-            # Orijinal şarkıyı ekle
-            original_processed = {
-                'timestamp': datetime.now(),
-                'title': original_song_data.get('title', 'Unknown'),
-                'artist': original_song_data.get('artist', 'Unknown'),
-                'genre': original_song_data.get('top_genre', 'unknown'),
-                'year': int(original_song_data.get('year', 2000)),
-                'popularity': float(original_song_data.get('popularity', 0)),
-                'energy': float(original_song_data.get('energy', 0)),
-                'danceability': float(original_song_data.get('danceability', 0)),
-                'valence': float(original_song_data.get('valence', 0)),
-                'event_type': 'rollback_original'
-            }
-            
-            buffer.append(original_processed)
-            
-            logger.info(f"Timeless data rollback: {boosted_title} popularity reverted")
-            
-        except Exception as e:
-            logger.error(f"Timeless rollback error: {e}")
-    
-    def analyze_real_time_impact(self, event_data):
-        try:
-            song_genre = event_data['song_data'].get('top_genre', 'unknown')
-            boost_amount = event_data['metadata'].get('boost_amount', 0)
-            
-            if song_genre in self.timeless_analyzer.timeless_metrics:
-                current_metric = self.timeless_analyzer.timeless_metrics[song_genre]
-                
-                impact_prediction = {
-                    'genre': song_genre,
-                    'current_timeless_score': current_metric.timeless_score,
-                    'boost_amount': boost_amount,
-                    'predicted_impact': 'positive' if boost_amount > 20 else 'neutral',
-                    'consistency_risk': 'high' if boost_amount > 40 else 'low',
-                    'timestamp': datetime.now().isoformat()
-                }
-                
-                logger.info(f"Impact: {song_genre} - {impact_prediction['predicted_impact']}")
-                
-        except Exception as e:
-            logger.error(f"Real-time impact analysis error: {e}")
-    
-    def generate_enhanced_analytics(self):
-        try:
-            self.generate_standard_windowed_analytics()
-            self.generate_timeless_insights()
-            
-        except Exception as e:
-            logger.error(f"Analytics generation error: {e}")
-    
-    def generate_standard_windowed_analytics(self):
-        try:
-            current_time = datetime.now()
-            recent_genres = [
-                g for g in self.analytics_buffer['genre_trends'] 
-                if (current_time - g['timestamp']).total_seconds() < 300
-            ]
-            
-            if recent_genres:
-                genre_stats = defaultdict(lambda: {'count': 0, 'total_popularity': 0})
-                
-                for genre_data in recent_genres:
-                    genre = genre_data['genre']
-                    popularity = genre_data.get('popularity', 0)
-                    if isinstance(popularity, (int, float)) and not pd.isna(popularity):
-                        genre_stats[genre]['count'] += 1
-                        genre_stats[genre]['total_popularity'] += popularity
-                
-                top_genres = []
-                for genre, stats in genre_stats.items():
-                    if stats['count'] > 0:
-                        avg_popularity = stats['total_popularity'] / stats['count']
-                        top_genres.append({
-                            'genre': genre,
-                            'count': stats['count'],
-                            'avg_popularity': round(avg_popularity, 2)
-                        })
-                
-                top_genres = sorted(top_genres, key=lambda x: x['avg_popularity'], reverse=True)[:5]
-                
-                if top_genres:
-                    logger.info("Recent Genre Trends:")
-                    for i, genre_stat in enumerate(top_genres, 1):
-                        logger.info(f"  {i}. {genre_stat['genre']}: {genre_stat['avg_popularity']}")
-                        
-        except Exception as e:
-            logger.error(f"Standard analytics error: {e}")
-    
-    def generate_timeless_insights(self):
-        try:
-            summary = self.timeless_analyzer.get_analytics_summary()
-            
-            if summary and summary.get('top_timeless_genres'):
-                champion = summary['top_timeless_genres'][0]
-                logger.info(f"Timeless Champion: {champion['genre']} ({champion['score']}/100)")
-                
-                stats = summary.get('statistics', {})
-                logger.info(f"Analytics: {stats.get('total_genres_analyzed', 0)} genres, "
-                          f"Avg: {stats.get('avg_timeless_score', 0):.1f}, "
-                          f"Max: {stats.get('max_timeless_score', 0):.1f}")
-                
-                # Timeout sistem durumu
-                logger.info(f"Timeout System: {self.timeout_stats['active_events']} active, "
-                          f"{self.timeout_stats['expired_events']} expired, "
-                          f"{self.timeout_stats['rollback_processed']} rollbacks")
-                        
-        except Exception as e:
-            logger.error(f"Timeless insights error: {e}")
-    
-    def update_performance_metrics(self):
-        self.metrics['messages_processed'] += 1
+        # Real-time events stream - FIXED
+        realtime_stream = self.spark \
+            .readStream \
+            .format("kafka") \
+            .option("kafka.bootstrap.servers", self.kafka_servers) \
+            .option("subscribe", "spotify-realtime-events") \
+            .option("startingOffsets", "latest") \
+            .option("failOnDataLoss", "false") \
+            .load()
         
-        if self.metrics['messages_processed'] % 100 == 0:
-            now = datetime.now()
-            time_diff = (now - self.metrics['last_update']).total_seconds()
-            
-            if time_diff > 0:
-                self.metrics['processing_rate'] = 100 / time_diff
-            
-            self.metrics['last_update'] = now
-            
-            uptime = (now - self.metrics['start_time']).total_seconds()
-            timeless_info = ""
-            if self.metrics['timeless_last_update']:
-                last_timeless = (now - self.metrics['timeless_last_update']).total_seconds()
-                timeless_info = f", last timeless: {last_timeless:.0f}s ago"
-            
-            logger.info(f"Performance: {self.metrics['messages_processed']} msgs, "
-                       f"{self.metrics['processing_rate']:.1f} msgs/sec, "
-                       f"uptime: {uptime:.0f}s, "
-                       f"timeless analyses: {self.metrics['timeless_analyses']}"
-                       f"{timeless_info}, "
-                       f"active events: {self.timeout_stats['active_events']}, "
-                       f"expired: {self.timeout_stats['expired_events']}")
-    
-    def kafka_consumer_loop_enhanced(self):
-        logger.info("Kafka consumer loop started")
+        # Parse real-time events with explicit extraction - FIXED
+        realtime_parsed = realtime_stream.select(
+            from_json(col("value").cast("string"), self.event_schema).alias("parsed_data")
+        )
         
-        try:
-            while self.running:
-                msg = self.consumer.poll(timeout=1.0)
-                
-                if msg is None:
-                    continue
-                    
-                if msg.error():
-                    if msg.error().code() == KafkaError._PARTITION_EOF:
-                        continue
-                    else:
-                        logger.error(f"Kafka error: {msg.error()}")
-                        continue
-                
-                try:
-                    message_data = json.loads(msg.value().decode('utf-8'))
-                    topic = msg.topic()
-                    
-                    if topic == 'spotify-historical-stream':
-                        self.process_song_data_enhanced(message_data)
-                    elif topic == 'spotify-realtime-events':
-                        self.process_real_time_event_enhanced(message_data)
-                    
-                    self.update_performance_metrics()
-                    
-                except json.JSONDecodeError as e:
-                    logger.error(f"JSON decode error: {e}")
-                except Exception as e:
-                    logger.error(f"Message processing error: {e}")
-                    
-        except KeyboardInterrupt:
-            logger.info("Consumer loop interrupted")
-        finally:
-            self.consumer.close()
-    
-    def enhanced_analytics_loop(self):
-        logger.info("Analytics loop started")
+        self.realtime_df = realtime_parsed.select(
+            col("parsed_data.song_data.title").alias("title"),
+            col("parsed_data.song_data.artist").alias("artist"),
+            col("parsed_data.song_data.top_genre").alias("top_genre"),
+            col("parsed_data.song_data.year").alias("year"),
+            col("parsed_data.song_data.popularity").alias("popularity"),
+            col("parsed_data.song_data.energy").alias("energy"),
+            col("parsed_data.song_data.danceability").alias("danceability"),
+            col("parsed_data.song_data.valence").alias("valence"),
+            col("parsed_data.song_data.acousticness").alias("acousticness"),
+            col("parsed_data.event_type").alias("event_type"),
+            col("parsed_data.metadata.event_id").alias("event_id"),
+            col("parsed_data.metadata.boost_amount").cast("int").alias("boost_amount"),
+            col("parsed_data.metadata.reason").alias("reason"),
+            col("parsed_data.metadata.original_popularity").cast("int").alias("original_popularity"),
+            col("parsed_data.metadata.has_timeout").cast("boolean").alias("has_timeout")
+        ).withColumn("processed_at", current_timestamp())
         
-        while self.running:
+        logger.info("Kafka streams configured successfully")
+    
+    def create_temp_views(self):
+        """Create temporary views for SQL analytics"""
+        # Create streaming temp views
+        self.historical_df.createOrReplaceTempView("historical_songs")
+        self.realtime_df.createOrReplaceTempView("realtime_events")
+        
+        logger.info("Temporary views created")
+    
+    def start_historical_analytics(self):
+        """Process historical data with Spark SQL - STREAMING COMPATIBLE"""
+        
+        # 1. Genre Trends Analysis - FIXED for streaming
+        genre_trends_query = self.spark.sql("""
+            SELECT 
+                top_genre as genre,
+                window(processed_at, '5 minutes') as time_window,
+                COUNT(*) as song_count,
+                AVG(popularity) as avg_popularity,
+                STDDEV(popularity) as std_popularity,
+                MAX(popularity) as max_popularity,
+                MIN(popularity) as min_popularity,
+                approx_count_distinct(artist) as unique_artists
+            FROM historical_songs 
+            WHERE top_genre IS NOT NULL
+            GROUP BY top_genre, window(processed_at, '5 minutes')
+        """)
+        
+        # Write to PostgreSQL
+        def write_genre_trends_to_postgres(df, epoch_id):
             try:
-                time.sleep(30)  # 45s -> 30s
-                if not self.running:
-                    break
-                    
-                self.generate_enhanced_analytics()
+                df.select(
+                    col("genre"),
+                    col("avg_popularity").cast("decimal(5,2)"),
+                    col("song_count").cast("integer"),
+                    col("time_window.start").alias("analysis_window"),
+                    col("std_popularity").cast("decimal(5,2)"),
+                    col("max_popularity").cast("integer"),
+                    col("min_popularity").cast("integer"),
+                    col("unique_artists").cast("integer")
+                ).write \
+                .format("jdbc") \
+                .options(**self.postgres_props) \
+                .option("dbtable", "genre_trends") \
+                .mode("append") \
+                .save()
+                logger.info(f"Wrote {df.count()} genre trend records")
+            except Exception as e:
+                logger.error(f"Error writing genre trends: {e}")
+        
+        genre_trends_stream = genre_trends_query.writeStream \
+            .foreachBatch(write_genre_trends_to_postgres) \
+            .outputMode("update") \
+            .trigger(processingTime="30 seconds") \
+            .option("checkpointLocation", "/tmp/genre_trends_checkpoint") \
+            .start()
+        
+        # 2. Song Analytics Storage - SIMPLIFIED
+        def write_song_analytics_to_postgres(df, epoch_id):
+            try:
+                df.select(
+                    col("title"),
+                    col("artist"), 
+                    col("top_genre").alias("genre"),
+                    col("year"),
+                    col("popularity"),
+                    col("energy"),
+                    col("danceability"),
+                    col("valence"),
+                    col("acousticness"),
+                    col("bpm"),
+                    col("length"),
+                    col("processed_at"),
+                    col("event_type"),
+                    col("source_timestamp")
+                ).write \
+                .format("jdbc") \
+                .options(**self.postgres_props) \
+                .option("dbtable", "song_analytics") \
+                .mode("append") \
+                .save()
+                logger.info(f"Wrote {df.count()} song records")
+            except Exception as e:
+                logger.error(f"Error writing songs: {e}")
+        
+        song_analytics_stream = self.historical_df.writeStream \
+            .foreachBatch(write_song_analytics_to_postgres) \
+            .outputMode("append") \
+            .trigger(processingTime="10 seconds") \
+            .option("checkpointLocation", "/tmp/song_analytics_checkpoint") \
+            .start()
+        
+        return [genre_trends_stream, song_analytics_stream]
+    
+    def start_realtime_analytics(self):
+        """Process real-time events with Spark SQL - JDBC COMPATIBLE VERSION"""
+        
+        def write_realtime_events_to_postgres(df, epoch_id):
+            try:
+                metadata_struct = struct(
+                    coalesce(col("event_id"), lit("")).alias("event_id"),
+                    coalesce(col("boost_amount").cast("int"), lit(0)).alias("boost_amount"),
+                    coalesce(col("reason"), lit("")).alias("reason"),
+                    coalesce(col("original_popularity").cast("int"), lit(0)).alias("original_popularity"),
+                    coalesce(col("has_timeout").cast("boolean"), lit(False)).alias("has_timeout")
+                )
                 
-                # Her 3 dakikada bir timeless analizi (5 dakikadan azaltıldı)
-                if self.metrics['messages_processed'] % 150 == 0:
-                    self.run_timeless_analysis()
+                df_processed = df.select(
+                    col("event_type"),
+                    col("title").alias("song_title"),
+                    col("artist"),
+                    to_json(metadata_struct).alias("metadata"),
+                    col("processed_at").alias("created_at"),
+                    coalesce(col("event_id"), lit("unknown")).alias("event_id"),
+                    coalesce(col("boost_amount").cast("int"), lit(0)).alias("boost_amount"),
+                    coalesce(col("reason"), lit("unknown")).alias("reason"),
+                    coalesce(col("original_popularity").cast("int"), lit(0)).alias("original_popularity"),
+                    coalesce(col("has_timeout").cast("boolean"), lit(False)).alias("has_timeout")
+                )
+                
+                # Write to PostgreSQL
+                df_processed.write \
+                    .format("jdbc") \
+                    .options(**self.postgres_props) \
+                    .option("dbtable", "real_time_events") \
+                    .mode("append") \
+                    .save()
+                
+                logger.info(f"Wrote {df.count()} real-time events")
                 
             except Exception as e:
-                logger.error(f"Analytics loop error: {e}")
-                time.sleep(10)
+                logger.error(f"Error writing real-time events: {e}")
+                # Fallback: Try simpler version without metadata
+                try:
+                    df.select(
+                        col("event_type"),
+                        col("title").alias("song_title"),
+                        col("artist"),
+                        lit('{}').alias("metadata"),  # Empty JSON
+                        col("processed_at").alias("created_at"),
+                        coalesce(col("event_id"), lit("unknown")).alias("event_id"),
+                        coalesce(col("boost_amount"), lit(0)).alias("boost_amount"),
+                        coalesce(col("reason"), lit("unknown")).alias("reason"),
+                        coalesce(col("original_popularity").cast("int"), lit(0)).alias("original_popularity"),
+                        coalesce(col("has_timeout").cast("boolean"), lit(False)).alias("has_timeout")
+                    ).write \
+                    .format("jdbc") \
+                    .options(**self.postgres_props) \
+                    .option("dbtable", "real_time_events") \
+                    .mode("append") \
+                    .save()
+                    
+                    logger.info(f"Wrote {df.count()} real-time events (fallback mode)")
+                except Exception as e2:
+                    logger.error(f"Fallback write also failed: {e2}")
+        
+        realtime_stream = self.realtime_df.writeStream \
+            .foreachBatch(write_realtime_events_to_postgres) \
+            .outputMode("append") \
+            .trigger(processingTime="5 seconds") \
+            .option("checkpointLocation", "/tmp/realtime_events_checkpoint") \
+            .start()
+        
+        return [realtime_stream]
     
-    def start_enhanced_streaming_analytics(self):
-        logger.info("Spotify Streaming Analytics starting")
-        
-        consumer_thread = threading.Thread(target=self.kafka_consumer_loop_enhanced, daemon=True)
-        consumer_thread.start()
-        
-        analytics_thread = threading.Thread(target=self.enhanced_analytics_loop, daemon=True)
-        analytics_thread.start()
-        
-        logger.info("Streaming analytics active")
-        logger.info("Timeless genre analysis integrated")
-        
-        return [consumer_thread, analytics_thread]
-    
-    def get_enhanced_analytics(self):
-        standard_analytics = {
-            'genre_trends': list(self.analytics_buffer['genre_trends']),
-            'popularity_trends': list(self.analytics_buffer['popularity_trends']),
-            'real_time_events': list(self.analytics_buffer['real_time_events']),
-            'audio_features': list(self.analytics_buffer['audio_features']),
-            'artist_stats': list(self.analytics_buffer['artist_stats']),
-            'metrics': self.metrics.copy()
-        }
-        
-        timeless_analytics = {
-            'timeless_summary': self.timeless_analyzer.get_analytics_summary(),
-            'top_timeless_genres': [
-                {
-                    'genre': genre,
-                    'timeless_score': metric.timeless_score,
-                    'consistency_score': metric.consistency_score,
-                    'longevity_score': metric.longevity_score,
-                    'decade_presence': metric.decade_presence
+    def start_timeless_analytics(self):
+
+        def run_timeless_batch_analysis():
+            try:
+                # 1) Kaynak veriyi oku
+                existing_songs = (self.spark.read
+                    .format("jdbc")
+                    .options(**self.postgres_props)
+                    .option("dbtable", "public.song_analytics")
+                    .load()
+                )
+
+                # ✅ Eşik değerini düşür (ör. 10)
+                if existing_songs.count() < 10:
+                    logger.info("Not enough data for timeless analysis")
+                    return
+
+                existing_songs.createOrReplaceTempView("all_songs_batch")
+
+                # 2) Analiz (genre normalize + total_unique_artists üret)
+                timeless_analysis = self.spark.sql("""
+                    WITH base AS (
+                      SELECT lower(trim(genre)) AS genre_norm, *
+                      FROM all_songs_batch
+                      WHERE genre IS NOT NULL AND year IS NOT NULL
+                    ),
+                    genre_stats AS (
+                      SELECT 
+                        genre_norm AS genre,
+                        COUNT(*) AS total_songs,
+                        AVG(popularity) AS avg_popularity,
+                        STDDEV(popularity) AS std_popularity,
+                        COUNT(DISTINCT year) AS year_span,
+                        approx_count_distinct(artist) AS total_unique_artists,
+                        current_date() AS analysis_date
+                      FROM base
+                      GROUP BY genre_norm
+                      HAVING COUNT(*) >= 3
+                    )
+                    SELECT 
+                      genre,
+                      analysis_date,
+                      5 AS analysis_period_years,
+                      LEAST(100.0, avg_popularity + year_span * 2) AS timeless_score,
+                      CASE 
+                        WHEN avg_popularity > 0 THEN GREATEST(0.0, 100.0 - (std_popularity / avg_popularity * 100.0))
+                        ELSE 0.0
+                      END AS consistency_score,
+                      LEAST(100.0, year_span * 5.0) AS longevity_score,
+                      GREATEST(0.0, 100.0 - std_popularity) AS variance_score,
+                      avg_popularity AS peak_stability,
+                      LEAST(20, year_span) AS decade_presence,
+                      year_span,
+                      total_songs,
+                      total_unique_artists
+                    FROM genre_stats
+                    ORDER BY timeless_score DESC
+                """)
+
+                postgres_config = {
+                    'host': 'localhost',
+                    'port': 5432,
+                    'database': 'spotify_analytics',
+                    'user': 'spotify_user',
+                    'password': 'spotify_pass'
                 }
-                for genre, metric in self.timeless_analyzer.get_top_timeless_genres(10)
-            ],
-            'trending_changes': self.timeless_analyzer.get_trending_timeless_changes()
-        }
+
+                # ✅ Pre-delete: hata verse bile yazmayı engellemesin
+                try:
+                    genres = [r["genre"] for r in timeless_analysis.select("genre").distinct().collect()]
+                    if genres:
+                        conn = psycopg2.connect(
+                            host=postgres_config['host'],
+                            port=postgres_config['port'],
+                            database=postgres_config['database'],  # dbname alias'ı OK
+                            user=postgres_config['user'],
+                            password=postgres_config['password']
+                        )
+                        conn.autocommit = True
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                DELETE FROM public.timeless_genre_metrics
+                                WHERE analysis_date = CURRENT_DATE
+                                  AND genre = ANY(%s)
+                            """, (genres,))
+                        conn.close()
+                except Exception as del_err:
+                    logger.warning(f"Pre-delete skipped: {del_err}")
+
+                # 3) Skor kolonlarında NaN/NULL → 0.0
+                for c in ["timeless_score","consistency_score","longevity_score","variance_score","peak_stability"]:
+                    timeless_analysis = timeless_analysis.withColumn(
+                        c, nanvl(coalesce(col(c), lit(0.0)), lit(0.0))
+                    )
+
+                # 4) Yazmadan önce kaç satır gideceğini logla
+                rows_to_write = timeless_analysis.count()
+                logger.info(f"Timeless rows to write: {rows_to_write}")
+
+                # 5) Tip/isimleri tabloya hizala ve yaz
+                (timeless_analysis.select(
+                        col("genre"),
+                        col("analysis_date"),
+                        col("analysis_period_years").cast("int"),
+                        col("timeless_score").cast(DecimalType(5, 2)),
+                        col("consistency_score").cast(DecimalType(5, 2)),
+                        col("longevity_score").cast(DecimalType(5, 2)),
+                        col("variance_score").cast(DecimalType(5, 2)),
+                        col("peak_stability").cast(DecimalType(5, 2)),
+                        col("decade_presence").cast("int"),
+                        col("year_span").cast("int"),
+                        col("total_songs").cast("int"),
+                        col("total_unique_artists").cast("int")
+                    )
+                    .write
+                    .format("jdbc")
+                    .options(**{**self.postgres_props, "driver": "org.postgresql.Driver"})  # güvence
+                    .option("dbtable", "public.timeless_genre_metrics")
+                    .mode("append")
+                    .save()
+                )
+
+                logger.info(f"Updated timeless metrics for {rows_to_write} rows")
+
+            except Exception as e:
+                logger.error(f"Timeless analysis error: {e}")
+
+        # İlk analizi hemen çalıştır
+        run_timeless_batch_analysis()
+
+        # Periyodik
+        import threading, time
+        def periodic_timeless_analysis():
+            while True:
+                time.sleep(25)
+                run_timeless_batch_analysis()
+        threading.Thread(target=periodic_timeless_analysis, daemon=True).start()
+
+        return []
+
+    
+    def start_all_analytics(self):
+        """Start all Spark Structured Streaming analytics"""
+        logger.info("Setting up Kafka streams...")
+        self.setup_kafka_streams()
+        
+        logger.info("Creating temporary views...")
+        self.create_temp_views()
+        
+        logger.info("Starting historical analytics...")
+        historical_streams = self.start_historical_analytics()
+        
+        logger.info("Starting real-time analytics...")
+        realtime_streams = self.start_realtime_analytics()
+        
+        logger.info("Starting timeless analytics...")
+        timeless_streams = self.start_timeless_analytics()
+        
+        all_streams = historical_streams + realtime_streams + timeless_streams
+        
+        logger.info(f"Started {len(all_streams)} Spark Structured Streaming queries")
+        return all_streams
+    
+    def run_batch_analytics(self):
+        """Run batch analytics queries"""
+        logger.info("Running batch analytics...")
+        
+        # Read existing data from PostgreSQL for complex analytics
+        existing_songs = self.spark.read \
+            .format("jdbc") \
+            .options(**self.postgres_props) \
+            .option("dbtable", "song_analytics") \
+            .load()
+        
+        existing_songs.createOrReplaceTempView("all_songs")
+        
+        # Advanced Analytics Queries
+        
+        # 1. Audio Features Analysis by Genre
+        audio_features_analysis = self.spark.sql("""
+            SELECT 
+                genre,
+                AVG(energy) as avg_energy,
+                AVG(danceability) as avg_danceability, 
+                AVG(valence) as avg_valence,
+                AVG(acousticness) as avg_acousticness,
+                STDDEV(energy) as energy_variance,
+                COUNT(*) as song_count,
+                current_timestamp() as analysis_date
+            FROM all_songs
+            WHERE genre IS NOT NULL
+            GROUP BY genre
+            HAVING COUNT(*) >= 10
+            ORDER BY song_count DESC
+        """)
+        
+        # 2. Year-over-Year Genre Popularity Trends
+        yearly_trends = self.spark.sql("""
+            SELECT 
+                genre,
+                year,
+                AVG(popularity) as avg_popularity,
+                COUNT(*) as song_count,
+                COUNT(DISTINCT artist) as unique_artists,
+                ROW_NUMBER() OVER (PARTITION BY year ORDER BY AVG(popularity) DESC) as yearly_rank
+            FROM all_songs
+            WHERE genre IS NOT NULL AND year IS NOT NULL
+            GROUP BY genre, year
+            HAVING COUNT(*) >= 3
+            ORDER BY year DESC, avg_popularity DESC
+        """)
+        
+        # 3. Artist Dominance Analysis
+        artist_analysis = self.spark.sql("""
+            SELECT 
+                artist,
+                genre,
+                COUNT(*) as song_count,
+                AVG(popularity) as avg_popularity,
+                MAX(popularity) as peak_popularity,
+                COUNT(DISTINCT year) as years_active,
+                current_timestamp() as analysis_date
+            FROM all_songs
+            WHERE artist IS NOT NULL AND genre IS NOT NULL
+            GROUP BY artist, genre
+            HAVING COUNT(*) >= 5
+            ORDER BY avg_popularity DESC, song_count DESC
+        """)
+        
+        # Show results
+        logger.info("=== AUDIO FEATURES BY GENRE ===")
+        audio_features_analysis.show(10, truncate=False)
+        
+        logger.info("=== YEARLY GENRE TRENDS (Recent) ===")
+        yearly_trends.filter(col("year") >= 2015).show(20, truncate=False)
+        
+        logger.info("=== TOP ARTISTS BY GENRE ===")
+        artist_analysis.show(15, truncate=False)
         
         return {
-            'standard_analytics': standard_analytics,
-            'timeless_analytics': timeless_analytics,
-            'combined_metrics': {
-                'total_messages': self.metrics['messages_processed'],
-                'timeless_analyses': self.metrics['timeless_analyses'],
-                'genres_analyzed': len(self.timeless_analyzer.timeless_metrics),
-                'data_points': len(self.timeless_analyzer.genre_data_buffer)
-            },
-            'timeout_system': {
-                'total_events': self.timeout_stats['total_events'],
-                'active_events': self.timeout_stats['active_events'],
-                'expired_events': self.timeout_stats['expired_events'],
-                'rollback_processed': self.timeout_stats['rollback_processed'],
-                'active_event_details': [
-                    {
-                        'event_id': eid[:8],
-                        'title': data['song_data'].get('title', 'Unknown'),
-                        'artist': data['song_data'].get('artist', 'Unknown'),
-                        'created_time': data['created_time'].isoformat(),
-                        'status': data['status']
-                    }
-                    for eid, data in self.active_real_time_events.items()
-                ]
-            }
+            'audio_features': audio_features_analysis,
+            'yearly_trends': yearly_trends,
+            'artist_analysis': artist_analysis
         }
     
-    def stop_enhanced_streams(self):
-        logger.info("Stopping streaming analytics")
-        
-        self.running = False
-        
-        if hasattr(self, 'consumer'):
-            self.consumer.close()
-            
-        if hasattr(self, 'producer'):
-            self.producer.flush()
+    def stop_all_streams(self):
+        """Stop all streaming queries"""
+        for stream in self.spark.streams.active:
+            logger.info(f"Stopping stream: {stream.name}")
+            stream.stop()
         
         if self.spark:
             self.spark.stop()
         
-        logger.info("Resources cleaned")
+        logger.info("All streams stopped")
 
 if __name__ == "__main__":
-    print("SPOTIFY REAL-TIME + TIMELESS ANALYTICS")
+    import time
+    
+    print("SPOTIFY SPARK STRUCTURED STREAMING ANALYTICS")
     print("=" * 60)
     
-    analyzer = SpotifyStreamingAnalyzer()
+    analyzer = SpotifySparkStreamingAnalyzer()
     
     try:
-        threads = analyzer.start_enhanced_streaming_analytics()
+        # Start all streaming analytics
+        streams = analyzer.start_all_analytics()
         
-        print("Spotify Analytics Consumer active!")
-        print("Standard real-time analytics active")
-        print("Timeless genre analysis integrated")
-        print("Real-time event impact analysis active")
-        print("TIMEOUT SYSTEM: 30s auto-rollback for real-time events")
-        print("Analytics every 30 seconds")
-        print("Timeless rankings and trend changes")
-        print("Analytics results in console + Kafka")
-        print("Timeless Champion tracking active")
+        print("✅ Spark Structured Streaming Analytics Active!")
+        print("📊 Historical data → PostgreSQL (genre trends, song analytics)")
+        print("⚡ Real-time events → PostgreSQL (event tracking)")
+        print("🎯 Timeless analytics → PostgreSQL (genre metrics)")
+        print("📈 Advanced SQL analytics every 30-60 seconds")
+        print("🔄 Batch analytics available")
         print("Press Ctrl+C to stop")
         print("-" * 60)
         
+        # Run batch analytics every 5 minutes
+        last_batch_time = time.time()
+        
         while True:
-            time.sleep(1)
+            time.sleep(30)
             
+            # Check stream health
+            active_streams = [s for s in streams if s.isActive]
+            if len(active_streams) != len(streams):
+                logger.warning(f"Some streams stopped. Active: {len(active_streams)}/{len(streams)}")
+            
+            # Run batch analytics every 5 minutes
+            current_time = time.time()
+            if current_time - last_batch_time > 300:  # 5 minutes
+                try:
+                    analyzer.run_batch_analytics()
+                    last_batch_time = current_time
+                except Exception as e:
+                    logger.error(f"Batch analytics error: {e}")
+                    
     except KeyboardInterrupt:
-        print("\nStopping Consumer...")
+        print("\nStopping Spark Analytics...")
     finally:
-        analyzer.stop_enhanced_streams()
-        print("Spotify Analytics Consumer closed!")
+        analyzer.stop_all_streams()
+        print("Spark Analytics stopped!")

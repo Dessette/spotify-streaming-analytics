@@ -6,15 +6,24 @@ import signal
 import threading
 from datetime import datetime
 import psutil
-import re
+import psycopg2
 
-class SpotifySystemRunner:
+class SpotifySparkSystemRunner:
     def __init__(self):
         self.processes = {}
         self.running = True
         self.producer_completed = False
         self.producer_restart_count = 0
         self.max_producer_restarts = 1
+        self.reset_database = True  # Default to reset
+
+        self.pg_host = os.getenv("PG_HOST", "127.0.0.1")
+        self.pg_port = int(os.getenv("PG_PORT", "5432"))
+        self.pg_db   = os.getenv("PG_DB", "spotify_analytics")  # init.sql’deki isimle aynı olmalı
+        self.pg_user = os.getenv("PG_USER", "spotify_user")
+        self.pg_psw  = os.getenv("PG_PSW", "spotify_pass")
+
+        self.reset_database = os.getenv("RESET_DB", "true").lower() not in ("0","false","no","n")
         
     def log(self, message, level="INFO"):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -23,17 +32,69 @@ class SpotifySystemRunner:
             "SUCCESS": "\033[0;32m",  # Green
             "WARNING": "\033[1;33m",  # Yellow
             "ERROR": "\033[0;31m",  # Red
+            "SPARK": "\033[0;35m",  # Magenta
+            "CLEANUP": "\033[0;33m",  # Yellow
             "RESET": "\033[0m"
         }
         
         color = colors.get(level, colors["RESET"])
         print(f"{color}[{timestamp}] {level}: {message}{colors['RESET']}")
     
+    def cleanup_database_tables(self):
+        """Public şemadaki TÜM tabloları dinamik TRUNCATE eder (FK için CASCADE)."""
+        if not self.reset_database:
+            self.log("Database cleanup disabled", "INFO")
+            return True
+
+        try:
+            self.log("🗑️ Cleaning up analytics database (dynamic)...", "CLEANUP")
+
+            conn = psycopg2.connect(
+                host=self.pg_host,
+                port=self.pg_port,
+                database=self.pg_db,
+                user=self.pg_user,
+                password=self.pg_psw
+            )
+            conn.autocommit = True
+            cur = conn.cursor()
+
+            # Public şemadaki bütün tabloları listele
+            cur.execute("""
+                SELECT tablename
+                FROM pg_tables
+                WHERE schemaname='public'
+                ORDER BY tablename;
+            """)
+            tables = [r[0] for r in cur.fetchall()]
+
+            if not tables:
+                self.log("Public şemada tablo bulunamadı; temizlenecek bir şey yok.", "WARNING")
+                cur.close()
+                conn.close()
+                return True
+
+            # Hepsini tek komutta TRUNCATE et (CASCADE FK’ler için)
+            truncate_sql = "TRUNCATE TABLE " + ", ".join([f'public."{t}"' for t in tables]) + " RESTART IDENTITY CASCADE;"
+            cur.execute(truncate_sql)
+            self.log(f"✅ Truncated tables: {', '.join(tables)}", "CLEANUP")
+
+            cur.close()
+            conn.close()
+            self.log("🎯 Database cleanup completed - Fresh start guaranteed!", "SUCCESS")
+            return True
+
+        except Exception as e:
+            self.log(f"Database cleanup error: {e}", "ERROR")
+            self.log("Continuing without cleanup...", "WARNING")
+            return False
+
+    
     def check_requirements(self):
-        """Gerekli dosyaların ve servislerin kontrolü"""
-        self.log("Sistem gereksinimleri kontrol ediliyor...")
+        """Check system requirements"""
+        self.log("Checking Spark system requirements...", "SPARK")
         
-        # Gerekli Python dosyalarını kontrol et
+        # Required Python files
         required_files = [
             'kafka_producer.py',
             'spark_streaming_consumer.py', 
@@ -47,43 +108,117 @@ class SpotifySystemRunner:
                 missing_files.append(file)
         
         if missing_files:
-            self.log(f"Eksik dosyalar: {missing_files}", "ERROR")
+            self.log(f"Missing files: {missing_files}", "ERROR")
             return False
         
-        # Data klasörünü kontrol et
+        # Check data directory
         if not os.path.exists('./data'):
-            self.log("./data klasörü oluşturuluyor...", "WARNING")
+            self.log("Creating ./data directory...", "WARNING")
             os.makedirs('./data')
         
-        # CSV dosyasını kontrol et
+        # Check CSV file
         csv_files = [f for f in os.listdir('./data') if f.endswith('.csv')]
         if not csv_files:
-            self.log("./data klasöründe CSV dosyası bulunamadı!", "WARNING")
-            self.log("Spotify dataset'ini https://www.kaggle.com/datasets/iamsumat/spotify-top-2000s-mega-dataset adresinden indirin", "INFO")
+            self.log("No CSV file found in ./data directory!", "WARNING")
+            self.log("Download Spotify dataset from https://www.kaggle.com/datasets/iamsumat/spotify-top-2000s-mega-dataset", "INFO")
         else:
-            self.log(f"Dataset bulundu: {csv_files[0]}", "SUCCESS")
+            self.log(f"Dataset found: {csv_files[0]}", "SUCCESS")
         
-        # Docker servislerini kontrol et
+        # Check Docker services
         try:
             result = subprocess.run(['docker', 'ps', '--format', 'table {{.Names}}'], 
                                   capture_output=True, text=True, check=True)
-            if 'spotify-kafka' in result.stdout and 'spotify-postgres' in result.stdout:
-                self.log("Docker servisleri aktif", "SUCCESS")
+            required_services = ['kafka', 'postgres', 'spark-master']
+            missing_services = []
+            
+            for service in required_services:
+                if service not in result.stdout:
+                    missing_services.append(service)
+            
+            if missing_services:
+                self.log(f"Missing Docker services: {missing_services}", "WARNING")
+                self.log("Run: docker-compose up -d", "INFO")
             else:
-                self.log("Docker servisleri başlatılmamış. setup_spotify_system.sh çalıştırın", "WARNING")
+                self.log("Docker services active", "SUCCESS")
+                
         except subprocess.CalledProcessError:
-            self.log("Docker bulunamadı veya çalışmıyor", "ERROR")
+            self.log("Docker not found or not running", "ERROR")
+            return False
+        
+        # Check PostgreSQL connection
+        try:
+            conn = psycopg2.connect(
+                host="127.0.0.1",
+                port=5432,
+                database="spotify_analytics",
+                user="spotify_user",
+                password="spotify_pass"
+            )
+            conn.close()
+            self.log("PostgreSQL connection verified", "SUCCESS")
+        except Exception as e:
+            self.log(f"PostgreSQL connection failed: {e}", "ERROR")
+            self.log("Ensure PostgreSQL container is running", "WARNING")
+            return False
+        
+        # Check PySpark
+        try:
+            import pyspark
+            self.log(f"PySpark version: {pyspark.__version__}", "SPARK")
+        except ImportError:
+            self.log("PySpark not found! Install with: pip install pyspark", "ERROR")
             return False
         
         return True
     
+    def get_database_statistics(self):
+        """Public şemadaki tüm tabloların satır sayısını göster."""
+        try:
+            conn = psycopg2.connect(
+                host=self.pg_host,
+                port=self.pg_port,
+                database=self.pg_db,
+                user=self.pg_user,
+                password=self.pg_psw
+            )
+            cur = conn.cursor()
+
+            cur.execute("""
+                SELECT tablename
+                FROM pg_tables
+                WHERE schemaname='public'
+                ORDER BY tablename;
+            """)
+            tables = [r[0] for r in cur.fetchall()]
+
+            stats = {}
+            for t in tables:
+                try:
+                    cur.execute(f'SELECT COUNT(*) FROM public."{t}";')
+                    stats[t] = cur.fetchone()[0]
+                except Exception as e:
+                    stats[t] = f"Error: {e}"
+
+            cur.close()
+            conn.close()
+
+            self.log("=== DATABASE STATISTICS ===", "INFO")
+            for table, count in stats.items():
+                self.log(f'{table}: {count} records', "INFO")
+            return stats
+
+        except Exception as e:
+            self.log(f"Error getting database statistics: {e}", "ERROR")
+            return {}
+
+    
     def start_producer(self):
-        """Kafka Producer'ı başlat"""
+        """Start Kafka Producer"""
         if self.producer_completed and self.producer_restart_count >= self.max_producer_restarts:
-            self.log("Producer dataset'ini tamamladı, restart edilmiyor", "INFO")
+            self.log("Producer dataset completed, not restarting", "INFO")
             return True
             
-        self.log("Kafka Producer başlatılıyor...")
+        self.log("Starting Kafka Producer (UNLIMITED mode)...", "INFO")
         try:
             process = subprocess.Popen(
                 [sys.executable, 'kafka_producer.py'],
@@ -94,71 +229,77 @@ class SpotifySystemRunner:
             )
             self.processes['producer'] = process
             
-            # Producer output'unu thread'de oku ve completion'ı yakayla
             def read_producer_output():
                 for line in iter(process.stdout.readline, ''):
                     if self.running:
                         print(f"[PRODUCER] {line.strip()}")
                         
-                        # Dataset completion sinyallerini yakala
+                        # Detect completion signals
                         if any(keyword in line.lower() for keyword in [
                             'streaming completed', 
                             'producer closed',
-                            'total songs sent',
-                            'streaming tamamlandı'
+                            'total songs sent'
                         ]):
-                            self.log("Producer dataset'ini tamamladı", "SUCCESS")
+                            self.log("Producer dataset completed", "SUCCESS")
                             self.producer_completed = True
                         
-                        # Error sinyallerini yakala
+                        # Detect error signals
                         if any(keyword in line.lower() for keyword in [
                             'csv read error',
                             'dataset setup guide',
                             'file not found'
                         ]):
-                            self.log("Producer data error ile durdu", "ERROR")
+                            self.log("Producer stopped with data error", "ERROR")
                             
                 process.stdout.close()
             
             threading.Thread(target=read_producer_output, daemon=True).start()
-            self.log("Kafka Producer başlatıldı", "SUCCESS")
+            self.log("Kafka Producer started (UNLIMITED processing)", "SUCCESS")
             return True
             
         except Exception as e:
-            self.log(f"Producer başlatma hatası: {e}", "ERROR")
+            self.log(f"Producer startup error: {e}", "ERROR")
             return False
     
-    def start_consumer(self):
-        """Spark Consumer'ı başlat"""
-        self.log("Spark Consumer başlatılıyor...")
+    def start_spark_consumer(self):
+        """Start Spark Structured Streaming Consumer (UNLIMITED)"""
+        self.log("Starting Spark UNLIMITED Consumer...", "SPARK")
         try:
+            # Set Spark environment variables
+            env = os.environ.copy()
+            env['PYSPARK_PYTHON'] = sys.executable
+            env['PYSPARK_DRIVER_PYTHON'] = sys.executable
+            
+            # Use the improved consumer
+            consumer_file = 'spark_streaming_consumer.py'  # Updated consumer
+            
             process = subprocess.Popen(
-                [sys.executable, 'spark_streaming_consumer.py'],
+                [sys.executable, consumer_file],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
-                bufsize=1
+                bufsize=1,
+                env=env
             )
-            self.processes['consumer'] = process
+            self.processes['spark_consumer'] = process
             
-            # Consumer output'unu thread'de oku
-            def read_consumer_output():
+            def read_spark_output():
                 for line in iter(process.stdout.readline, ''):
                     if self.running:
-                        print(f"[CONSUMER] {line.strip()}")
+                        print(f"[SPARK] {line.strip()}")
                 process.stdout.close()
             
-            threading.Thread(target=read_consumer_output, daemon=True).start()
-            self.log("Spark Consumer başlatıldı", "SUCCESS")
+            threading.Thread(target=read_spark_output, daemon=True).start()
+            self.log("Spark UNLIMITED Consumer started", "SPARK")
             return True
             
         except Exception as e:
-            self.log(f"Consumer başlatma hatası: {e}", "ERROR")
+            self.log(f"Spark Consumer startup error: {e}", "ERROR")
             return False
     
     def start_dashboard(self):
-        """Dashboard'u başlat"""
-        self.log("Dashboard başlatılıyor...")
+        """Start Dashboard"""
+        self.log("Starting Spark-powered Dashboard...", "INFO")
         try:
             process = subprocess.Popen(
                 [sys.executable, 'interactive_dashboard.py'],
@@ -169,7 +310,6 @@ class SpotifySystemRunner:
             )
             self.processes['dashboard'] = process
             
-            # Dashboard output'unu thread'de oku
             def read_dashboard_output():
                 for line in iter(process.stdout.readline, ''):
                     if self.running:
@@ -177,157 +317,187 @@ class SpotifySystemRunner:
                 process.stdout.close()
             
             threading.Thread(target=read_dashboard_output, daemon=True).start()
-            self.log("Dashboard başlatıldı: http://localhost:8050", "SUCCESS")
+            self.log("Dashboard started: http://localhost:8050", "SUCCESS")
             return True
             
         except Exception as e:
-            self.log(f"Dashboard başlatma hatası: {e}", "ERROR")
+            self.log(f"Dashboard startup error: {e}", "ERROR")
             return False
     
     def monitor_processes(self):
-        """Process'leri izle ve akıllıca yeniden başlat"""
-        self.log("Akıllı process monitoring başlatıldı...")
+        """Monitor processes with intelligent restart logic"""
+        self.log("Process monitoring started...", "INFO")
         
         while self.running:
             try:
-                time.sleep(15)  # Her 15 saniyede kontrol et (10'dan artırıldı)
+                time.sleep(20)
                 
                 for name, process in list(self.processes.items()):
-                    if process.poll() is not None:  # Process öldü
+                    if process.poll() is not None:
                         return_code = process.returncode
                         
                         if name == 'producer':
                             if self.producer_completed or return_code == 0:
-                                # Normal completion
-                                self.log("Producer normal şekilde tamamlandı", "SUCCESS")
+                                self.log("Producer completed normally", "SUCCESS")
                                 self.producer_completed = True
-                                # Producer'ı process listesinden çıkar
                                 del self.processes['producer']
                                 continue
                             elif self.producer_restart_count < self.max_producer_restarts:
-                                # Hata ile durdu, restart et
-                                self.log(f"Producer crashed (code: {return_code}), restart edilyor... ({self.producer_restart_count + 1}/{self.max_producer_restarts})", "WARNING")
+                                self.log(f"Producer crashed, restarting... ({self.producer_restart_count + 1}/{self.max_producer_restarts})", "WARNING")
                                 self.producer_restart_count += 1
                                 self.start_producer()
                                 time.sleep(5)
                             else:
-                                # Max restart'a ulaşıldı
-                                self.log("Producer max restart sayısına ulaştı, restart edilmiyor", "WARNING")
+                                self.log("Producer reached max restarts", "WARNING")
                                 del self.processes['producer']
                         
-                        elif name == 'consumer':
+                        elif name == 'spark_consumer':
                             if return_code == 0:
-                                self.log("Consumer normal şekilde kapandı", "INFO")
+                                self.log("Spark Consumer closed normally", "INFO")
                             else:
-                                self.log(f"Consumer crashed (code: {return_code}), restart edilyor...", "WARNING")
-                                self.start_consumer()
-                                time.sleep(5)
+                                self.log(f"Spark Consumer crashed, restarting...", "WARNING")
+                                self.start_spark_consumer()
+                                time.sleep(10)
                         
                         elif name == 'dashboard':
                             if return_code == 0:
-                                self.log("Dashboard normal şekilde kapandı", "INFO")
+                                self.log("Dashboard closed normally", "INFO")
                             else:
-                                self.log(f"Dashboard crashed (code: {return_code}), restart edilyor...", "WARNING")
+                                self.log(f"Dashboard crashed, restarting...", "WARNING")
                                 self.start_dashboard()
                                 time.sleep(5)
                         
             except Exception as e:
                 if self.running:
-                    self.log(f"Monitoring hatası: {e}", "ERROR")
-                    time.sleep(5)
+                    self.log(f"Monitoring error: {e}", "ERROR")
+                    time.sleep(10)
     
     def show_system_status(self):
-        """Sistem durumunu göster"""
-        self.log("=== SİSTEM DURUMU ===", "INFO")
+        """Show comprehensive system status"""
+        self.log("=== UNLIMITED SPARK SYSTEM STATUS ===", "SPARK")
         
-        # Process durumları
+        # Process statuses
         for name, process in self.processes.items():
             if process.poll() is None:
-                self.log(f"{name.upper()}: ÇALIŞIYOR (PID: {process.pid})", "SUCCESS")
+                if name == 'spark_consumer':
+                    self.log(f"{name.upper()}: RUNNING (PID: {process.pid}) ⚡ UNLIMITED", "SUCCESS")
+                else:
+                    self.log(f"{name.upper()}: RUNNING (PID: {process.pid})", "SUCCESS")
             else:
-                self.log(f"{name.upper()}: DURDURULDU (Return Code: {process.returncode})", "ERROR")
+                self.log(f"{name.upper()}: STOPPED (Return Code: {process.returncode})", "ERROR")
         
-        # Producer özel durumu
+        # Producer special status
         if 'producer' not in self.processes:
             if self.producer_completed:
-                self.log("PRODUCER: DATASET TAMAMLANDI", "SUCCESS")
+                self.log("PRODUCER: DATASET COMPLETED ✅", "SUCCESS")
             else:
-                self.log("PRODUCER: BAŞLATILMADI VEYA DURDU", "WARNING")
+                self.log("PRODUCER: NOT STARTED OR STOPPED", "WARNING")
         
-        # Resource kullanımı
+        # Database statistics
+        self.get_database_statistics()
+        
+        # System resources
         try:
             cpu_percent = psutil.cpu_percent(interval=1)
             memory = psutil.virtual_memory()
             
-            self.log(f"CPU Kullanımı: {cpu_percent}%", "INFO")
-            self.log(f"RAM Kullanımı: {memory.percent}% ({memory.used // 1024 // 1024} MB / {memory.total // 1024 // 1024} MB)", "INFO")
+            self.log(f"CPU Usage: {cpu_percent}%", "INFO")
+            self.log(f"RAM Usage: {memory.percent}% ({memory.used // 1024 // 1024} MB / {memory.total // 1024 // 1024} MB)", "INFO")
         except:
-            self.log("Resource bilgileri alınamadı", "WARNING")
+            self.log("Resource information unavailable", "WARNING")
         
-        # Restart bilgileri
-        if self.producer_restart_count > 0:
-            self.log(f"Producer restart sayısı: {self.producer_restart_count}/{self.max_producer_restarts}", "INFO")
-        
-        # URL'ler
-        self.log("=== ERİŞİM URL'LERİ ===", "INFO")
-        self.log("🎵 Dashboard: http://localhost:8050", "INFO")
+        # Access URLs
+        self.log("=== ACCESS URLS ===", "INFO")
+        self.log("🎵 Spark Dashboard: http://localhost:8050", "INFO")
+        self.log("⚡ Spark Master UI: http://localhost:8081", "SPARK")
         self.log("🔧 Kafka UI: http://localhost:8080", "INFO")
         self.log("🗄️ pgAdmin: http://localhost:5050", "INFO")
         
         print()
     
-    def restart_producer_manual(self):
-        """Manuel producer restart"""
-        if 'producer' in self.processes:
-            self.log("Mevcut producer kapatılıyor...", "INFO")
-            self.processes['producer'].terminate()
-            time.sleep(3)
-            if self.processes['producer'].poll() is None:
-                self.processes['producer'].kill()
-            del self.processes['producer']
+    def reset_system_data(self):
+        """Reset all system data"""
+        self.log("🔄 Resetting system data...", "CLEANUP")
         
+        # Stop all processes first
+        for name, process in self.processes.items():
+            if process.poll() is None:
+                self.log(f"Stopping {name}...", "INFO")
+                process.terminate()
+                time.sleep(3)
+                if process.poll() is None:
+                    process.kill()
+        
+        self.processes.clear()
+        
+        # Clean database
+        self.cleanup_database_tables()
+        
+        # Reset flags
         self.producer_completed = False
         self.producer_restart_count = 0
-        self.start_producer()
+        
+        self.log("✅ System data reset completed", "SUCCESS")
     
     def signal_handler(self, signum, frame):
         """Graceful shutdown"""
-        self.log("Shutdown signal alındı, sistem kapatılıyor...", "WARNING")
+        self.log("Shutdown signal received...", "WARNING")
         self.running = False
         
         for name, process in self.processes.items():
             if process.poll() is None:
-                self.log(f"{name} kapatılıyor...", "INFO")
+                self.log(f"Stopping {name}...", "INFO")
                 process.terminate()
                 
-                # 5 saniye bekle, sonra force kill
+                timeout = 15 if 'spark' in name else 5
+                
                 try:
-                    process.wait(timeout=5)
+                    process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
-                    self.log(f"{name} force kill ediliyor...", "WARNING")
+                    self.log(f"Force killing {name}...", "WARNING")
                     process.kill()
         
-        self.log("Sistem kapatıldı", "SUCCESS")
+        self.log("System stopped", "SUCCESS")
         sys.exit(0)
     
     def run(self):
-        """Ana çalıştırma fonksiyonu"""
-        # Signal handler'ları ayarla
+        """Main execution function"""
+        # Signal handlers
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
         
-        print("🎵" + "="*80 + "🎵")
-        print("    🚀 SPOTIFY TIMELESS ANALYTICS SYSTEM RUNNER 🚀")
-        print("🎵" + "="*80 + "🎵")
+        print("⚡" + "="*80 + "⚡")
+        print("    🚀 SPOTIFY UNLIMITED SPARK ANALYTICS SYSTEM 🚀")
+        print("⚡" + "="*80 + "⚡")
+        print("💪 NO DATA LIMITS - FULL DATASET PROCESSING")
+        print("🗑️ DATABASE RESET ON STARTUP")
+        print("🎭 ALL GENRES PRESERVED AND ANALYZED")
+        print("=" * 82)
         print()
         
-        # Gereksinimleri kontrol et
+        # Ask user about database reset
+        try:
+            user_choice = input("Reset database on startup? [Y/n]: ").strip().lower()
+            if user_choice in ['n', 'no']:
+                self.reset_database = False
+                self.log("Database reset disabled by user", "INFO")
+            else:
+                self.reset_database = True
+                self.log("Database will be reset for fresh start", "CLEANUP")
+        except:
+            self.reset_database = True
+        
+        # Check requirements
         if not self.check_requirements():
-            self.log("Gereksinimler karşılanmadı, çıkılıyor...", "ERROR")
+            self.log("Requirements not met, exiting...", "ERROR")
             return
         
-        # Servisleri sırayla başlat
-        self.log("Servisler başlatılıyor...", "INFO")
+        # Clean database if requested
+        if self.reset_database:
+            self.cleanup_database_tables()
+        
+        # Start services in order
+        self.log("Starting UNLIMITED services...", "SPARK")
         time.sleep(2)
         
         # 1. Producer
@@ -335,56 +505,83 @@ class SpotifySystemRunner:
             return
         time.sleep(5)
         
-        # 2. Consumer 
-        if not self.start_consumer():
+        # 2. Spark Consumer (UNLIMITED)
+        if not self.start_spark_consumer():
             return
-        time.sleep(5)
+        time.sleep(10)
         
         # 3. Dashboard
         if not self.start_dashboard():
             return
-        time.sleep(3)
+        time.sleep(5)
         
-        # Durum göster
+        # Show status
         self.show_system_status()
         
-        # Monitoring başlat
+        # Start monitoring
         monitor_thread = threading.Thread(target=self.monitor_processes, daemon=True)
         monitor_thread.start()
         
-        self.log("🎉 Tüm servisler başarıyla başlatıldı!", "SUCCESS")
-        self.log("📊 Dataset completion otomatik detect edilecek", "INFO")
-        self.log("⏹️ Durdurmak için Ctrl+C'ye basın", "INFO")
+        self.log("🎉 UNLIMITED Spark Analytics System operational!", "SUCCESS")
+        self.log("⚡ Apache Spark UNLIMITED Streaming active", "SPARK")
+        self.log("📊 ALL data → PostgreSQL (no limits)", "INFO")
+        self.log("🎭 ALL genres analyzed (no filtering)", "INFO")
+        self.log("🎵 UNLIMITED song processing", "INFO")
+        self.log("⏹️ Press Ctrl+C to stop", "INFO")
         print("=" * 80)
         
-        # Ana loop - kullanıcı input'u bekle
+        # Main loop - user input
         try:
             while self.running:
-                user_input = input("Komut (status/restart-producer/help/quit): ").strip().lower()
+                print("\nCommands:")
+                print("  status (s)     - Show system status")
+                print("  reset (r)      - Reset all data and restart")
+                print("  db-stats (d)   - Show database statistics")
+                print("  restart-prod   - Restart producer only")
+                print("  help (h)       - Show this help")
+                print("  quit (q)       - Stop the system")
                 
-                if user_input == 'quit' or user_input == 'q':
+                user_input = input("\nCommand: ").strip().lower()
+                
+                if user_input in ['quit', 'q']:
                     break
-                elif user_input == 'status' or user_input == 's':
+                elif user_input in ['status', 's']:
                     self.show_system_status()
-                elif user_input == 'restart-producer' or user_input == 'rp':
-                    self.restart_producer_manual()
-                elif user_input == 'help' or user_input == 'h':
-                    print("Mevcut komutlar:")
-                    print("  status           - Sistem durumunu göster")
-                    print("  restart-producer - Producer'ı manuel restart et")
-                    print("  help             - Bu yardım mesajını göster")
-                    print("  quit             - Sistemi kapat")
+                elif user_input in ['reset', 'r']:
+                    self.reset_system_data()
+                    print("Restarting services...")
+                    time.sleep(2)
+                    self.start_producer()
+                    time.sleep(5)
+                    self.start_spark_consumer()
+                    time.sleep(10)
+                    self.start_dashboard()
+                elif user_input in ['db-stats', 'd']:
+                    self.get_database_statistics()
+                elif user_input == 'restart-prod':
+                    if 'producer' in self.processes:
+                        self.processes['producer'].terminate()
+                        time.sleep(3)
+                        if self.processes['producer'].poll() is None:
+                            self.processes['producer'].kill()
+                        del self.processes['producer']
+                    
+                    self.producer_completed = False
+                    self.producer_restart_count = 0
+                    self.start_producer()
+                elif user_input in ['help', 'h']:
+                    print("UNLIMITED Spark Analytics System Commands")
                 elif user_input == '':
                     continue
                 else:
-                    print(f"Bilinmeyen komut: {user_input}")
+                    print(f"Unknown command: {user_input}")
                     
         except EOFError:
             pass
         
-        # Temizlik
+        # Cleanup
         self.signal_handler(None, None)
 
 if __name__ == "__main__":
-    runner = SpotifySystemRunner()
+    runner = SpotifySparkSystemRunner()
     runner.run()

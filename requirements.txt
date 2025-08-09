@@ -1,12 +1,32 @@
-kafka-python==2.0.2
+# Core Spark Dependencies
 pyspark==3.4.1
+py4j==0.10.9.7
+
+# Kafka Integration
+kafka-python==2.0.2
+confluent-kafka==2.2.0
+
+# Database Integration
+psycopg2-binary==2.9.7
+sqlalchemy==2.0.21
+
+# Dashboard and Visualization
 dash==2.14.1
 plotly==5.17.0
+dash-bootstrap-components==1.5.0
+
+# Data Processing
 pandas==2.1.1
 numpy==1.24.3
+
+# Optional Analytics
 seaborn==0.12.2
 matplotlib==3.7.2
-kagglehub==0.2.5
+
+# System and Utilities
 redis==4.6.0
-psycopg2-binary==2.9.7
-dash-bootstrap-components==1.5.0
+kagglehub==0.2.5
+
+# Additional Spark packages (install via spark-submit)
+# org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.1
+# org.postgresql:postgresql:42.6.0

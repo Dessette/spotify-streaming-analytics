@@ -1,669 +1,425 @@
-import pandas as pd
-import numpy as np
-from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.window import Window
 import logging
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
-import json
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class GenreTimelessMetric:
-    genre: str
-    decade_presence: int
-    consistency_score: float
-    longevity_score: float
-    variance_score: float
-    peak_stability: float
-    timeless_score: float
-    period_stats: Dict
-    last_updated: datetime
-
-class TimelessGenreAnalyzer:
-    def __init__(self, analysis_periods=None):
-        if analysis_periods is None:
-            analysis_periods = [5, 10]
-            
-        self.analysis_periods = analysis_periods
-        self.genre_data_buffer = deque(maxlen=5000)  # Küçültüldü
-        self.timeless_metrics = {}
-        self.historical_rankings = deque(maxlen=50)  # Küçültüldü
-        
-        # Hızlı cache
-        self.analysis_cache = {
-            'last_analysis': None,
-            'cache_duration': 30,  # 30 saniye cache
-            'cached_results': {}
-        }
-        
-        # Minimum requirements azaltıldı
-        self.min_songs_per_period = 5  # 10'dan 5'e
-        self.min_periods_for_timeless = 2  # 3'ten 2'ye
-        
-    def add_song_data(self, song_data: Dict):
-        try:
-            # Event tracking yoksa oluştur (backward compatibility)
-            if not hasattr(self, 'event_tracking'):
-                self.event_tracking = {
-                    'processed_events': 0,
-                    'rollback_events': 0,
-                    'surge_events': 0,
-                    'historical_events': 0,
-                    'event_impact_history': deque(maxlen=100)
-                }
-            
-            event_type = song_data.get('event_type', 'historical')
-            
-            processed_data = {
-                'timestamp': datetime.now(),
-                'title': song_data.get('title', 'Unknown'),
-                'artist': song_data.get('artist', 'Unknown'),
-                'genre': song_data.get('top_genre', 'unknown'),
-                'year': int(song_data.get('year', 2000)),
-                'popularity': float(song_data.get('popularity', 0)),
-                'energy': float(song_data.get('energy', 0)),
-                'danceability': float(song_data.get('danceability', 0)),
-                'valence': float(song_data.get('valence', 0)),
-                'event_type': event_type
-            }
-            
-            # Event type'a göre işleme
-            if event_type == 'rollback_original':
-                self.handle_rollback_event(processed_data)
-            elif event_type == 'popularity_surge':
-                self.handle_surge_event(processed_data)
-            else:
-                self.handle_historical_event(processed_data)
-            
-            self.genre_data_buffer.append(processed_data)
-            
-            # Event tracking güncelle
-            self.event_tracking['processed_events'] += 1
-            if event_type == 'rollback_original':
-                self.event_tracking['rollback_events'] += 1
-            elif event_type == 'popularity_surge':
-                self.event_tracking['surge_events'] += 1
-            else:
-                self.event_tracking['historical_events'] += 1
-            
-        except Exception as e:
-            logger.error(f"Song data processing error: {e}")
-    
-    def handle_rollback_event(self, processed_data):
-        """Rollback event'leri için özel işleme"""
-        try:
-            # Rollback event impact'ini kaydet
-            impact_record = {
-                'timestamp': datetime.now(),
-                'event_type': 'rollback',
-                'genre': processed_data['genre'],
-                'title': processed_data['title'],
-                'artist': processed_data['artist'],
-                'popularity': processed_data['popularity'],
-                'impact': 'negative_correction'  # Popularity düşüş
-            }
-            
-            self.event_tracking['event_impact_history'].append(impact_record)
-            
-            logger.debug(f"Rollback processed: {processed_data['title']} by {processed_data['artist']}")
-            
-        except Exception as e:
-            logger.error(f"Rollback event handling error: {e}")
-    
-    def handle_surge_event(self, processed_data):
-        """Popularity surge event'leri için özel işleme"""
-        try:
-            # Surge event impact'ini kaydet
-            impact_record = {
-                'timestamp': datetime.now(),
-                'event_type': 'surge',
-                'genre': processed_data['genre'],
-                'title': processed_data['title'],
-                'artist': processed_data['artist'],
-                'popularity': processed_data['popularity'],
-                'impact': 'positive_boost'  # Popularity artış
-            }
-            
-            self.event_tracking['event_impact_history'].append(impact_record)
-            
-            logger.debug(f"Surge processed: {processed_data['title']} by {processed_data['artist']}")
-            
-        except Exception as e:
-            logger.error(f"Surge event handling error: {e}")
-    
-    def handle_historical_event(self, processed_data):
-        """Normal historical event'ler için standart işleme"""
-        try:
-            # Historical event'ler için impact kaydı (opsiyonel)
-            if self.event_tracking['processed_events'] % 100 == 0:  # Her 100 event'te bir log
-                impact_record = {
-                    'timestamp': datetime.now(),
-                    'event_type': 'historical',
-                    'genre': processed_data['genre'],
-                    'impact': 'neutral'
-                }
-                self.event_tracking['event_impact_history'].append(impact_record)
-            
-        except Exception as e:
-            logger.error(f"Historical event handling error: {e}")
-    
-    def calculate_period_stats(self, genre_songs: List[Dict], period_years: int) -> Dict:
-        if not genre_songs:
-            return {}
-            
-        years = sorted(set(song['year'] for song in genre_songs))
-        if not years:
-            return {}
-            
-        min_year, max_year = min(years), max(years)
-        year_range = max_year - min_year + 1
-        
-        periods = []
-        current_start = min_year
-        
-        while current_start <= max_year:
-            period_end = min(current_start + period_years - 1, max_year)
-            period_songs = [s for s in genre_songs 
-                          if current_start <= s['year'] <= period_end]
-            
-            if len(period_songs) >= self.min_songs_per_period:
-                period_stats = {
-                    'start_year': current_start,
-                    'end_year': period_end,
-                    'song_count': len(period_songs),
-                    'avg_popularity': np.mean([s['popularity'] for s in period_songs]),
-                    'std_popularity': np.std([s['popularity'] for s in period_songs]),
-                    'max_popularity': max(s['popularity'] for s in period_songs),
-                    'min_popularity': min(s['popularity'] for s in period_songs),
-                    'unique_artists': len(set(s['artist'] for s in period_songs)),
-                    'avg_energy': np.mean([s['energy'] for s in period_songs]),
-                    'avg_danceability': np.mean([s['danceability'] for s in period_songs]),
-                    'avg_valence': np.mean([s['valence'] for s in period_songs])
-                }
-                periods.append(period_stats)
-            
-            current_start += period_years
-        
-        return {
-            'periods': periods,
-            'total_periods': len(periods),
-            'year_span': year_range,
-            'total_songs': len(genre_songs)
-        }
-    
-    def calculate_consistency_score(self, period_stats: Dict) -> float:
-        periods = period_stats.get('periods', [])
-        if len(periods) < 2:
-            return 0.0
-            
-        popularities = [p['avg_popularity'] for p in periods]
-        pop_mean = np.mean(popularities)
-        pop_variance = np.var(popularities) if len(popularities) > 1 else 0
-        
-        consistency_score = max(0, 100 - (pop_variance / pop_mean * 100) if pop_mean > 0 else 0)
-        
-        return min(100, consistency_score)
-    
-    def calculate_longevity_score(self, period_stats: Dict) -> float:
-        periods = period_stats.get('periods', [])
-        if not periods:
-            return 0.0
-            
-        decade_presence = len(periods)
-        year_span = period_stats.get('year_span', 0)
-        year_bonus = min(50, year_span * 2)
-        period_bonus = min(30, decade_presence * 10)
-        total_songs = period_stats.get('total_songs', 0)
-        song_bonus = min(20, np.log10(total_songs + 1) * 10) if total_songs > 0 else 0
-        
-        longevity_score = year_bonus + period_bonus + song_bonus
-        return min(100, longevity_score)
-    
-    def calculate_peak_stability(self, period_stats: Dict) -> float:
-        periods = period_stats.get('periods', [])
-        if len(periods) < 2:
-            return 0.0
-            
-        popularities = [p['avg_popularity'] for p in periods]
-        sorted_pops = sorted(popularities, reverse=True)
-        threshold = sorted_pops[len(sorted_pops)//2] if len(sorted_pops) > 1 else sorted_pops[0]
-        
-        peak_periods = [p for p in periods if p['avg_popularity'] >= threshold]
-        
-        if len(peak_periods) < 2:
-            return 50.0
-            
-        peak_pops = [p['avg_popularity'] for p in peak_periods]
-        peak_variance = np.var(peak_pops)
-        peak_mean = np.mean(peak_pops)
-        
-        if peak_mean > 0:
-            stability_score = max(0, 100 - (peak_variance / peak_mean * 200))
+class SparkTimelessGenreAnalyzer:
+    def __init__(self, spark_session=None):
+        # Spark Session
+        if spark_session:
+            self.spark = spark_session
         else:
-            stability_score = 0
-            
-        return min(100, stability_score)
-    
-    def calculate_timeless_score(self, consistency: float, longevity: float, 
-                               peak_stability: float, period_count: int) -> float:
-        weights = {
-            'consistency': 0.35,
-            'longevity': 0.30,
-            'peak_stability': 0.25,
-            'period_bonus': 0.10
+            self.spark = SparkSession.builder \
+                .appName("TimelessGenreAnalytics") \
+                .config("spark.sql.adaptive.enabled", "true") \
+                .getOrCreate()
+        
+        # PostgreSQL properties
+        self.postgres_props = {
+            "user": "spotify_user",
+            "password": "spotify_pass", 
+            "driver": "org.postgresql.Driver",
+            "url": "jdbc:postgresql://localhost:5432/spotify_analytics"
         }
         
-        if period_count < self.min_periods_for_timeless:
-            return 0.0
-            
-        period_bonus = min(100, period_count * 20)
+        # STRICT ANALYSIS PARAMETERS
+        self.analysis_year_start = 1960  # Fixed start
+        self.analysis_year_end = 2024    # Fixed end  
+        self.total_analysis_years = self.analysis_year_end - self.analysis_year_start + 1  # 65 years
         
-        timeless_score = (
-            consistency * weights['consistency'] +
-            longevity * weights['longevity'] +
-            peak_stability * weights['peak_stability'] +
-            period_bonus * weights['period_bonus']
+        # Period configurations
+        self.decade_length = 10  # Fixed 10-year decades
+        self.max_possible_decades = self.total_analysis_years // self.decade_length  # 6-7 decades max
+        
+        # Minimum requirements (STRICT)
+        self.min_songs_per_decade = 10   # Higher threshold
+        self.min_decades_for_timeless = 3  # Must span at least 3 decades
+        self.min_total_songs = 50          # Minimum total songs
+        
+        logger.info(f"Initialized STRICT timeless analysis:")
+        logger.info(f"  Analysis period: {self.analysis_year_start}-{self.analysis_year_end} ({self.total_analysis_years} years)")
+        logger.info(f"  Max possible decades: {self.max_possible_decades}")
+        logger.info(f"  Min songs per decade: {self.min_songs_per_decade}")
+        logger.info(f"  Min decades required: {self.min_decades_for_timeless}")
+
+    def load_song_data(self):
+        """Load and strictly filter song data"""
+        logger.info("Loading song data with STRICT filtering...")
+        
+        song_data = self.spark.read \
+            .format("jdbc") \
+            .options(**self.postgres_props) \
+            .option("dbtable", "song_analytics") \
+            .load()
+        
+        # VERY STRICT filtering
+        cleaned_data = song_data.filter(
+            (col("genre").isNotNull()) & 
+            (col("year").isNotNull()) & 
+            (col("popularity").isNotNull()) &
+            (col("year") >= self.analysis_year_start) & 
+            (col("year") <= self.analysis_year_end) &
+            (col("popularity") >= 1) &   # No zero popularity
+            (col("popularity") <= 100) &
+            (col("title").isNotNull()) &
+            (col("artist").isNotNull())
+        ).withColumn(
+            "decade", 
+            floor(col("year") / self.decade_length) * self.decade_length
+        ).withColumn(
+            "decade_label",
+            concat(col("decade").cast("string"), lit("s"))
         )
         
-        return min(100, timeless_score)
-    
-    def analyze_genre_timelessness(self, force_refresh=False) -> Dict[str, GenreTimelessMetric]:
-        current_time = datetime.now()
+        cleaned_data.cache()
         
-        # Cache kontrolü
-        if (not force_refresh and 
-            self.analysis_cache['last_analysis'] and
-            (current_time - self.analysis_cache['last_analysis']).total_seconds() < 
-            self.analysis_cache['cache_duration']):
-            return self.analysis_cache['cached_results']
+        total_songs = cleaned_data.count()
+        unique_genres = cleaned_data.select("genre").distinct().count()
+        year_range = cleaned_data.select(min("year"), max("year")).first()
         
-        all_songs = list(self.genre_data_buffer)
-        if len(all_songs) < 20:  # Minimum veri azaltıldı
+        logger.info(f"STRICT filtered data:")
+        logger.info(f"  Total songs: {total_songs}")
+        logger.info(f"  Unique genres: {unique_genres}")
+        logger.info(f"  Year range: {year_range[0]}-{year_range[1]}")
+        
+        return cleaned_data
+
+    def calculate_timeless_scores(self):
+        """Calculate REALISTIC timeless scores - no genre should get 100/100"""
+        song_data = self.load_song_data()
+        song_data.createOrReplaceTempView("songs")
+        
+        # STRICT SQL analysis
+        timeless_query = f"""
+            WITH decade_analysis AS (
+                SELECT 
+                    genre,
+                    decade,
+                    decade + 9 as decade_end,
+                    COUNT(*) as songs_in_decade,
+                    ROUND(AVG(popularity), 2) as avg_popularity,
+                    ROUND(STDDEV(popularity), 2) as popularity_std,
+                    MAX(popularity) as max_popularity,
+                    MIN(popularity) as min_popularity,
+                    COUNT(DISTINCT artist) as unique_artists,
+                    COUNT(DISTINCT year) as years_covered
+                FROM songs
+                GROUP BY genre, decade
+                HAVING COUNT(*) >= {self.min_songs_per_decade}
+            ),
+            genre_summary AS (
+                SELECT 
+                    genre,
+                    COUNT(*) as decades_active,
+                    MIN(decade) as first_decade,
+                    MAX(decade) as last_decade,
+                    SUM(songs_in_decade) as total_songs,
+                    SUM(unique_artists) as total_artists,
+                    
+                    -- Popularity metrics across decades
+                    AVG(avg_popularity) as overall_avg_popularity,
+                    ROUND(STDDEV(avg_popularity), 2) as decade_popularity_variance,
+                    MAX(avg_popularity) as peak_decade_popularity,
+                    MIN(avg_popularity) as lowest_decade_popularity,
+                    
+                    -- Collect all decade data for analysis
+                    COLLECT_LIST(STRUCT(decade, avg_popularity, songs_in_decade)) as decade_data
+                FROM decade_analysis
+                GROUP BY genre
+                HAVING COUNT(*) >= {self.min_decades_for_timeless}
+                   AND SUM(songs_in_decade) >= {self.min_total_songs}
+            ),
+            scoring AS (
+                SELECT 
+                    genre,
+                    decades_active,
+                    (last_decade - first_decade) / 10 + 1 as time_span_decades,
+                    total_songs,
+                    total_artists,
+                    overall_avg_popularity,
+                    decade_popularity_variance,
+                    peak_decade_popularity,
+                    lowest_decade_popularity,
+                    
+                    -- 1. DECADE PRESENCE SCORE (0-100): Based on actual decades covered
+                    ROUND(
+                        LEAST(100.0, (decades_active * 100.0) / {self.max_possible_decades})
+                    , 1) as decade_presence_score,
+                    
+                    -- 2. CONSISTENCY SCORE (0-100): STRICT - Low variance across decades  
+                    ROUND(
+                        CASE 
+                            WHEN overall_avg_popularity > 0 AND decade_popularity_variance > 0 THEN
+                                GREATEST(0, 100 - (decade_popularity_variance / overall_avg_popularity * 300))
+                            WHEN decade_popularity_variance = 0 THEN 85.0  -- Perfect consistency but capped
+                            ELSE 0
+                        END
+                    , 1) as consistency_score,
+                    
+                    -- 3. LONGEVITY SCORE (0-100): STRICT - Real time span matters
+                    ROUND(
+                        LEAST(100.0, 
+                            ((last_decade - first_decade) / 50.0) * 60 +  -- Max 60 points for 50+ year span
+                            (decades_active * 5) +                         -- Max 30-35 points for decade count
+                            LEAST(10, LOG10(total_songs) * 3)             -- Max 10 points for song volume
+                        )
+                    , 1) as longevity_score,
+                    
+                    -- 4. STABILITY SCORE (0-100): STRICT - Peak vs valley difference
+                    ROUND(
+                        CASE 
+                            WHEN peak_decade_popularity > lowest_decade_popularity THEN
+                                GREATEST(0, 100 - 
+                                    ((peak_decade_popularity - lowest_decade_popularity) / overall_avg_popularity * 200)
+                                )
+                            ELSE 70.0  -- No variance but capped
+                        END
+                    , 1) as stability_score,
+                    
+                    -- Popularity tier for weighting
+                    CASE 
+                        WHEN overall_avg_popularity >= 70 THEN 'high'
+                        WHEN overall_avg_popularity >= 45 THEN 'medium' 
+                        ELSE 'low'
+                    END as popularity_tier
+                FROM genre_summary
+            ),
+            final_scoring AS (
+                SELECT 
+                    genre,
+                    decades_active,
+                    time_span_decades,
+                    total_songs,
+                    total_artists,
+                    ROUND(overall_avg_popularity, 1) as avg_popularity,
+                    popularity_tier,
+                    
+                    -- Individual scores (all capped realistically)
+                    decade_presence_score,
+                    consistency_score,
+                    longevity_score, 
+                    stability_score,
+                    
+                    -- 5. POPULARITY PENALTY: Lower popularity = penalty
+                    ROUND(
+                        CASE 
+                            WHEN overall_avg_popularity < 30 THEN 15  -- -15 points for low popularity
+                            WHEN overall_avg_popularity < 45 THEN 8   -- -8 points for medium-low
+                            WHEN overall_avg_popularity < 60 THEN 3   -- -3 points for medium
+                            ELSE 0                                     -- No penalty for high popularity
+                        END
+                    , 1) as popularity_penalty,
+                    
+                    -- 6. RECENCY CHECK: Declining genres get penalty
+                    CASE 
+                        WHEN last_decade < {self.analysis_year_end - 20} THEN 12  -- Not active in last 20 years = -12
+                        WHEN last_decade < {self.analysis_year_end - 10} THEN 6   -- Not active in last 10 years = -6
+                        ELSE 0
+                    END as recency_penalty
+                    
+                FROM scoring
+            )
+            SELECT 
+                genre,
+                decades_active as decade_presence,
+                time_span_decades,
+                total_songs,
+                total_artists,
+                avg_popularity,
+                popularity_tier,
+                
+                -- Individual component scores
+                decade_presence_score,
+                consistency_score,
+                longevity_score,
+                stability_score,
+                popularity_penalty,
+                recency_penalty,
+                
+                -- FINAL TIMELESS SCORE: Weighted combination with penalties
+                -- NO GENRE SHOULD REALISTICALLY GET 100/100
+                ROUND(
+                    GREATEST(0,
+                        (consistency_score * 0.35 +          -- 35% - Most important
+                         longevity_score * 0.25 +            -- 25% - Time span matters  
+                         stability_score * 0.20 +            -- 20% - Peak consistency
+                         decade_presence_score * 0.20) -     -- 20% - Decade coverage
+                        popularity_penalty -                  -- Subtract penalties
+                        recency_penalty
+                    )
+                , 1) as timeless_score,
+                
+                current_date() as analysis_date,
+                {self.decade_length} as analysis_period_years
+                
+            FROM final_scoring
+            WHERE 
+                consistency_score > 0 
+                AND longevity_score > 0 
+                AND decades_active >= {self.min_decades_for_timeless}
+            ORDER BY 
+                GREATEST(0,
+                    (consistency_score * 0.35 + longevity_score * 0.25 + 
+                     stability_score * 0.20 + decade_presence_score * 0.20) -
+                    popularity_penalty - recency_penalty
+                ) DESC
+        """
+        
+        result = self.spark.sql(timeless_query)
+        logger.info("STRICT timeless analysis completed")
+        return result
+
+    def show_realistic_expectations(self):
+        """Show what realistic scores should look like"""
+        logger.info("=== REALISTIC TIMELESS SCORE EXPECTATIONS ===")
+        logger.info("🎯 NO GENRE SHOULD GET 100/100 (impossible perfection)")
+        logger.info("🏆 90-95: Legendary (Classical, maybe Jazz)")
+        logger.info("🥇 80-89: Excellent (Rock, Blues, Folk)")  
+        logger.info("🥈 70-79: Very Good (Pop, Country, Soul)")
+        logger.info("🥉 60-69: Good (Hip-Hop, R&B, Reggae)")
+        logger.info("📊 50-59: Average (Electronic, Punk, Indie)")
+        logger.info("📉 40-49: Below Average (Disco, New Wave)")
+        logger.info("❌ <40: Trend-based (Dubstep, Emo, Grunge)")
+
+    def get_genre_breakdown(self, genre):
+        """Get detailed breakdown for a specific genre"""
+        song_data = self.load_song_data()
+        
+        genre_detail = song_data.filter(col("genre") == genre) \
+            .groupBy("decade", "decade_label") \
+            .agg(
+                count("*").alias("songs"),
+                round(avg("popularity"), 1).alias("avg_pop"),
+                countDistinct("artist").alias("artists"),
+                min("year").alias("first_year"),
+                max("year").alias("last_year")
+            ).orderBy("decade")
+        
+        logger.info(f"=== {genre.upper()} DECADE BREAKDOWN ===")
+        genre_detail.show(truncate=False)
+        
+        return genre_detail
+
+    def store_timeless_metrics(self, df):
+        """Store results to PostgreSQL"""
+        logger.info("Storing STRICT timeless metrics...")
+        
+        try:
+            df_to_store = df.select(
+                col("genre"),
+                col("analysis_date"),
+                col("analysis_period_years").cast("int"),
+                col("timeless_score").cast(DecimalType(5,2)),
+                col("consistency_score").cast(DecimalType(5,2)),
+                col("longevity_score").cast(DecimalType(5,2)),
+                col("stability_score").cast(DecimalType(5,2)),  # Map to variance_score column
+                col("decade_presence_score").cast(DecimalType(5,2)),  # Map to peak_stability column
+                col("decade_presence").cast("int"),
+                col("time_span_decades").cast("int").alias("year_span"),
+                col("total_songs").cast("int"),
+                col("total_artists").cast("int").alias("total_unique_artists"),
+                lit(None).cast("string").alias("period_stats"),
+                lit(None).cast("string").alias("analysis_metadata")
+            )
+            
+            df_to_store.write \
+                .format("jdbc") \
+                .options(**self.postgres_props) \
+                .option("dbtable", "timeless_genre_metrics") \
+                .mode("append") \
+                .save()
+            
+            logger.info(f"Stored {df.count()} STRICT timeless metrics")
+            
+        except Exception as e:
+            logger.error(f"Storage error: {e}")
+
+    def run_strict_analysis(self):
+        """Run the complete STRICT timeless analysis"""
+        self.show_realistic_expectations()
+        
+        logger.info("Running STRICT timeless analysis...")
+        logger.info("🎯 Fixed decades: 1960s, 1970s, 1980s, 1990s, 2000s, 2010s, 2020s")
+        logger.info("⚖️ Realistic scoring: No perfect 100/100 scores")
+        logger.info("🔒 High thresholds: 10+ songs per decade, 3+ decades minimum")
+        
+        # Calculate timeless scores
+        timeless_df = self.calculate_timeless_scores()
+        
+        if timeless_df.count() == 0:
+            logger.warning("❌ No genres met the STRICT criteria!")
             return {}
         
-        genre_groups = defaultdict(list)
-        for song in all_songs:
-            genre_groups[song['genre']].append(song)
+        # Store results  
+        self.store_timeless_metrics(timeless_df)
         
-        results = {}
+        # Show results
+        logger.info("=== TOP TIMELESS GENRES (STRICT ANALYSIS) ===")
+        timeless_df.select(
+            "genre", 
+            "timeless_score", 
+            "decade_presence",
+            "consistency_score",
+            "longevity_score", 
+            "stability_score",
+            "popularity_tier"
+        ).show(20, truncate=False)
         
-        for genre, songs in genre_groups.items():
-            if len(songs) < self.min_songs_per_period * 2:
-                continue
-                
-            try:
-                best_score = 0
-                best_period_stats = None
-                best_period_years = None
-                
-                for period_years in self.analysis_periods:
-                    period_stats = self.calculate_period_stats(songs, period_years)
-                    
-                    if period_stats.get('total_periods', 0) < self.min_periods_for_timeless:
-                        continue
-                    
-                    consistency = self.calculate_consistency_score(period_stats)
-                    longevity = self.calculate_longevity_score(period_stats)
-                    peak_stability = self.calculate_peak_stability(period_stats)
-                    
-                    popularities = [p['avg_popularity'] for p in period_stats.get('periods', [])]
-                    if len(popularities) > 1:
-                        variance = np.var(popularities)
-                        mean_pop = np.mean(popularities)
-                        variance_score = max(0, 100 - (variance / mean_pop * 50)) if mean_pop > 0 else 0
-                    else:
-                        variance_score = 0
-                    
-                    timeless_score = self.calculate_timeless_score(
-                        consistency, longevity, peak_stability, 
-                        period_stats.get('total_periods', 0)
-                    )
-                    
-                    if timeless_score > best_score:
-                        best_score = timeless_score
-                        best_period_stats = period_stats
-                        best_period_years = period_years
-                
-                if best_period_stats and best_score > 0:
-                    metric = GenreTimelessMetric(
-                        genre=genre,
-                        decade_presence=best_period_stats.get('total_periods', 0),
-                        consistency_score=self.calculate_consistency_score(best_period_stats),
-                        longevity_score=self.calculate_longevity_score(best_period_stats),
-                        variance_score=variance_score,
-                        peak_stability=self.calculate_peak_stability(best_period_stats),
-                        timeless_score=best_score,
-                        period_stats=best_period_stats,
-                        last_updated=current_time
-                    )
-                    
-                    results[genre] = metric
-                    
-            except Exception as e:
-                logger.error(f"Genre {genre} analizi hatası: {e}")
-                continue
-        
-        self.analysis_cache['last_analysis'] = current_time
-        self.analysis_cache['cached_results'] = results
-        self.timeless_metrics = results
-        
-        if results:
-            ranking = {
-                'timestamp': current_time,
-                'top_timeless': sorted(results.items(), 
-                                     key=lambda x: x[1].timeless_score, 
-                                     reverse=True)[:10]
-            }
-            self.historical_rankings.append(ranking)
-        
-        return results
-    
-    def get_top_timeless_genres(self, limit=10) -> List[Tuple[str, GenreTimelessMetric]]:
-        if not self.timeless_metrics:
-            self.analyze_genre_timelessness()
+        # Show detailed breakdown for top genre
+        if timeless_df.count() > 0:
+            top_genre = timeless_df.first()
+            logger.info(f"\n🏆 TOP TIMELESS: {top_genre['genre'].upper()}")
+            logger.info(f"   Final Score: {top_genre['timeless_score']}/100")
+            logger.info(f"   Decades Active: {top_genre['decade_presence']}/{self.max_possible_decades}")
+            logger.info(f"   Consistency: {top_genre['consistency_score']}/100") 
+            logger.info(f"   Longevity: {top_genre['longevity_score']}/100")
+            logger.info(f"   Stability: {top_genre['stability_score']}/100")
+            logger.info(f"   Popularity Tier: {top_genre['popularity_tier']}")
             
-        sorted_genres = sorted(
-            self.timeless_metrics.items(),
-            key=lambda x: x[1].timeless_score,
-            reverse=True
-        )
-        
-        return sorted_genres[:limit]
-    
-    def get_genre_timeline(self, genre: str) -> Dict:
-        if genre not in self.timeless_metrics:
-            return {}
-            
-        metric = self.timeless_metrics[genre]
-        periods = metric.period_stats.get('periods', [])
-        
-        timeline = []
-        for period in periods:
-            timeline.append({
-                'period': f"{period['start_year']}-{period['end_year']}",
-                'start_year': period['start_year'],
-                'end_year': period['end_year'],
-                'avg_popularity': round(period['avg_popularity'], 2),
-                'song_count': period['song_count'],
-                'artists': period['unique_artists'],
-                'stability': round(100 - period['std_popularity'], 2) if period['std_popularity'] > 0 else 100
-            })
+            # Show decade breakdown
+            self.get_genre_breakdown(top_genre['genre'])
         
         return {
-            'genre': genre,
-            'timeline': timeline,
-            'overall_metrics': {
-                'timeless_score': round(metric.timeless_score, 2),
-                'consistency': round(metric.consistency_score, 2),
-                'longevity': round(metric.longevity_score, 2),
-                'peak_stability': round(metric.peak_stability, 2)
-            }
+            'timeless_metrics': timeless_df,
+            'total_analyzed': timeless_df.count(),
+            'max_score_achieved': timeless_df.agg(max("timeless_score")).collect()[0][0],
+            'avg_score': timeless_df.agg(avg("timeless_score")).collect()[0][0]
         }
-    
-    def get_analytics_summary(self) -> Dict:
-        # Event tracking yoksa oluştur (backward compatibility)
-        if not hasattr(self, 'event_tracking'):
-            self.event_tracking = {
-                'processed_events': 0,
-                'rollback_events': 0,
-                'surge_events': 0,
-                'historical_events': 0,
-                'event_impact_history': deque(maxlen=100)
-            }
-            
-        if not self.timeless_metrics:
-            return {}
-            
-        top_timeless = self.get_top_timeless_genres(5)
-        all_scores = [m.timeless_score for m in self.timeless_metrics.values()]
-        decade_counts = [m.decade_presence for m in self.timeless_metrics.values()]
-        
-        summary = {
-            'total_genres_analyzed': len(self.timeless_metrics),
-            'top_timeless_genres': [
-                {
-                    'genre': genre,
-                    'score': round(metric.timeless_score, 2),
-                    'decades': metric.decade_presence,
-                    'consistency': round(metric.consistency_score, 2)
-                }
-                for genre, metric in top_timeless
-            ],
-            'statistics': {
-                'avg_timeless_score': round(np.mean(all_scores), 2) if all_scores else 0,
-                'max_timeless_score': round(max(all_scores), 2) if all_scores else 0,
-                'avg_decade_presence': round(np.mean(decade_counts), 2) if decade_counts else 0,
-                'total_data_points': len(self.genre_data_buffer)
-            },
-            'event_system': {
-                'processed_events': self.event_tracking['processed_events'],
-                'rollback_events': self.event_tracking['rollback_events'],
-                'surge_events': self.event_tracking['surge_events'],
-                'historical_events': self.event_tracking['historical_events'],
-                'rollback_percentage': round((self.event_tracking['rollback_events'] / max(1, self.event_tracking['surge_events'])) * 100, 1),
-                'recent_impact_summary': self.get_recent_impact_summary()
-            },
-            'last_analysis': self.analysis_cache['last_analysis'].isoformat() if self.analysis_cache['last_analysis'] else None
-        }
-        
-        return summary
-    
-    def get_recent_impact_summary(self) -> Dict:
-        # Event tracking yoksa oluştur (backward compatibility)
-        if not hasattr(self, 'event_tracking'):
-            self.event_tracking = {
-                'processed_events': 0,
-                'rollback_events': 0,
-                'surge_events': 0,
-                'historical_events': 0,
-                'event_impact_history': deque(maxlen=100)
-            }
-            
-        try:
-            recent_impacts = list(self.event_tracking['event_impact_history'])[-20:]  # Son 20 event
-            
-            if not recent_impacts:
-                return {'surge_count': 0, 'rollback_count': 0, 'affected_genres': []}
-            
-            surge_count = len([i for i in recent_impacts if i['impact'] == 'positive_boost'])
-            rollback_count = len([i for i in recent_impacts if i['impact'] == 'negative_correction'])
-            
-            # Etkilenen genre'ler
-            affected_genres = list(set([i['genre'] for i in recent_impacts if i['event_type'] in ['surge', 'rollback']]))
-            
-            return {
-                'surge_count': surge_count,
-                'rollback_count': rollback_count,
-                'affected_genres': affected_genres[:5],  # Top 5
-                'net_impact': surge_count - rollback_count
-            }
-            
-        except Exception as e:
-            logger.error(f"Recent impact summary error: {e}")
-            return {'surge_count': 0, 'rollback_count': 0, 'affected_genres': []}
-    
-    def get_event_analytics(self) -> Dict:
-        # Event tracking yoksa oluştur (backward compatibility)
-        if not hasattr(self, 'event_tracking'):
-            self.event_tracking = {
-                'processed_events': 0,
-                'rollback_events': 0,
-                'surge_events': 0,
-                'historical_events': 0,
-                'event_impact_history': deque(maxlen=100)
-            }
-            
-        try:
-            total_events = self.event_tracking['processed_events']
-            surge_events = self.event_tracking['surge_events']
-            rollback_events = self.event_tracking['rollback_events']
-            
-            # Event success rate (rollback olmayan surge'lar)
-            active_surges = surge_events - rollback_events
-            success_rate = (active_surges / max(1, surge_events)) * 100 if surge_events > 0 else 0
-            
-            # Genre impact distribution
-            recent_impacts = list(self.event_tracking['event_impact_history'])[-50:]  # Son 50
-            genre_impact_count = defaultdict(int)
-            for impact in recent_impacts:
-                if impact['event_type'] in ['surge', 'rollback']:
-                    genre_impact_count[impact['genre']] += 1
-            
-            return {
-                'total_events': total_events,
-                'surge_events': surge_events,
-                'rollback_events': rollback_events,
-                'active_surges': active_surges,
-                'success_rate': round(success_rate, 1),
-                'most_impacted_genres': sorted(genre_impact_count.items(), key=lambda x: x[1], reverse=True)[:5],
-                'event_frequency': {
-                    'historical_percentage': round((self.event_tracking['historical_events'] / max(1, total_events)) * 100, 1),
-                    'surge_percentage': round((surge_events / max(1, total_events)) * 100, 1),
-                    'rollback_percentage': round((rollback_events / max(1, total_events)) * 100, 1)
-                }
-            }
-            
-        except Exception as e:
-            logger.error(f"Event analytics error: {e}")
-            return {}
-    
-    def get_trending_timeless_changes(self) -> List[Dict]:
-        if len(self.historical_rankings) < 2:
-            return []
-            
-        current = self.historical_rankings[-1]['top_timeless']
-        previous = self.historical_rankings[-2]['top_timeless']
-        
-        current_ranks = {genre: i for i, (genre, _) in enumerate(current)}
-        previous_ranks = {genre: i for i, (genre, _) in enumerate(previous)}
-        
-        changes = []
-        for genre, current_rank in current_ranks.items():
-            if genre in previous_ranks:
-                rank_change = previous_ranks[genre] - current_rank
-                if abs(rank_change) > 0:
-                    changes.append({
-                        'genre': genre,
-                        'current_rank': current_rank + 1,
-                        'previous_rank': previous_ranks[genre] + 1,
-                        'change': rank_change,
-                        'change_text': f"+{rank_change}" if rank_change > 0 else f"{rank_change}"
-                    })
-        
-        return sorted(changes, key=lambda x: abs(x['change']), reverse=True)[:5]
-    
-    def get_genre_volatility_analysis(self) -> Dict:
-        # Event tracking yoksa oluştur (backward compatibility)
-        if not hasattr(self, 'event_tracking'):
-            self.event_tracking = {
-                'processed_events': 0,
-                'rollback_events': 0,
-                'surge_events': 0,
-                'historical_events': 0,
-                'event_impact_history': deque(maxlen=100)
-            }
-            
-        try:
-            recent_impacts = list(self.event_tracking['event_impact_history'])[-100:]
-            
-            # Genre başına volatility hesapla
-            genre_volatility = defaultdict(lambda: {'surge_count': 0, 'rollback_count': 0, 'volatility_score': 0})
-            
-            for impact in recent_impacts:
-                if impact['event_type'] == 'surge':
-                    genre_volatility[impact['genre']]['surge_count'] += 1
-                elif impact['event_type'] == 'rollback':
-                    genre_volatility[impact['genre']]['rollback_count'] += 1
-            
-            # Volatility score hesapla (surge + rollback sayısı)
-            for genre, data in genre_volatility.items():
-                data['volatility_score'] = data['surge_count'] + data['rollback_count']
-                data['stability_ratio'] = data['rollback_count'] / max(1, data['surge_count'])
-            
-            # En volatile genre'leri sırala
-            most_volatile = sorted(
-                [(genre, data) for genre, data in genre_volatility.items()],
-                key=lambda x: x[1]['volatility_score'],
-                reverse=True
-            )[:5]
-            
-            return {
-                'most_volatile_genres': [
-                    {
-                        'genre': genre,
-                        'volatility_score': data['volatility_score'],
-                        'surge_count': data['surge_count'],
-                        'rollback_count': data['rollback_count'],
-                        'stability_ratio': round(data['stability_ratio'], 2)
-                    }
-                    for genre, data in most_volatile
-                ],
-                'total_volatile_events': len(recent_impacts),
-                'analysis_window': '100 recent events'
-            }
-            
-        except Exception as e:
-            logger.error(f"Volatility analysis error: {e}")
-            return {'most_volatile_genres': [], 'total_volatile_events': 0}
 
+    def cleanup(self):
+        """Clean up resources"""
+        if self.spark:
+            self.spark.stop()
 
 if __name__ == "__main__":
-    analyzer = TimelessGenreAnalyzer()
+    print("SPOTIFY STRICT TIMELESS GENRE ANALYTICS")
+    print("=" * 60)
+    print("🎯 REALISTIC SCORING: No perfect 100/100 scores")
+    print("📊 STRICT CRITERIA: 10+ songs/decade, 3+ decades minimum")
+    print("⏰ FIXED TIMEFRAME: 1960-2024 (65 years, 6-7 decades max)")
+    print("🏆 EXPECTED RANGE: 40-95 points (legends ~90, trends ~40)")
+    print("⚖️ PENALTIES: Low popularity, recency, inconsistency")
     
-    test_genres = ['rock', 'pop', 'jazz', 'classical', 'hip-hop']
-    test_years = list(range(1960, 2024))
+    analyzer = SparkTimelessGenreAnalyzer()
     
-    import random
-    
-    # Test verisi ekle (historical + surge + rollback)
-    for i in range(200):
-        genre = random.choice(test_genres)
-        year = random.choice(test_years)
+    try:
+        results = analyzer.run_strict_analysis()
         
-        if genre in ['jazz', 'classical']:
-            base_popularity = 45 + random.gauss(0, 5)
-        else:
-            base_popularity = random.randint(20, 80)
-            
-        # Event type'ı belirle
-        event_type = 'historical'
-        if i % 20 == 0:  # %5 surge event
-            event_type = 'popularity_surge'
-            base_popularity = min(100, base_popularity + random.randint(15, 30))
-        elif i % 25 == 0:  # %4 rollback event  
-            event_type = 'rollback_original'
-            
-        test_song = {
-            'title': f"Song {random.randint(1000, 9999)}",
-            'artist': f"Artist {random.randint(100, 999)}",
-            'top_genre': genre,
-            'year': year,
-            'popularity': max(0, min(100, base_popularity)),
-            'energy': random.randint(20, 90),
-            'danceability': random.randint(20, 90),
-            'valence': random.randint(20, 90),
-            'event_type': event_type
-        }
+        print("\n✅ STRICT Analysis Completed!")
+        print(f"📊 {results.get('total_analyzed', 0)} genres met strict criteria")
+        print(f"🏆 Highest score achieved: {results.get('max_score_achieved', 0):.1f}/100")
+        print(f"📈 Average score: {results.get('avg_score', 0):.1f}/100")
+        print("🎯 Realistic, no inflation!")
         
-        analyzer.add_song_data(test_song)
-    
-    results = analyzer.analyze_genre_timelessness()
-    top_timeless = analyzer.get_top_timeless_genres()
-    event_analytics = analyzer.get_event_analytics()
-    volatility_analysis = analyzer.get_genre_volatility_analysis()
-    
-    print("TOP TIMELESS GENRES:")
-    for i, (genre, metric) in enumerate(top_timeless, 1):
-        print(f"{i}. {genre.upper()}: {metric.timeless_score:.1f}/100")
-    
-    print(f"\nEVENT ANALYTICS:")
-    print(f"Total Events: {event_analytics.get('total_events', 0)}")
-    print(f"Surge Events: {event_analytics.get('surge_events', 0)}")
-    print(f"Rollback Events: {event_analytics.get('rollback_events', 0)}")
-    print(f"Success Rate: {event_analytics.get('success_rate', 0)}%")
-    
-    print(f"\nMOST VOLATILE GENRES:")
-    for genre_data in volatility_analysis.get('most_volatile_genres', [])[:3]:
-        print(f"{genre_data['genre']}: {genre_data['volatility_score']} events")
+        print("\n🎵 STRICT timeless analysis completed!")
+        
+    except Exception as e:
+        logger.error(f"Analysis error: {e}")
+        print(f"Analysis failed: {e}")
+    finally:
+        analyzer.cleanup()
+        print("Analysis completed.")

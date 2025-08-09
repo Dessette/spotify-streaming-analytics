@@ -53,29 +53,10 @@ class SpotifyDataStreamer:
         
         logger.info(f"Loading dataset from: {data_dir}")
         
-        if not os.path.exists(data_dir):
-            raise FileNotFoundError(
-                f"'{data_dir}' directory not found!\n"
-                f"Solution:\n"
-                f"   1. mkdir data\n"
-                f"   2. Download dataset: https://www.kaggle.com/datasets/iamsumat/spotify-top-2000s-mega-dataset\n"
-                f"   3. Extract ZIP to '{data_dir}' directory"
-            )
-        
         csv_files = []
         for file in os.listdir(data_dir):
             if file.endswith('.csv'):
                 csv_files.append(os.path.join(data_dir, file))
-        
-        if not csv_files:
-            raise FileNotFoundError(
-                f"No CSV files found in '{data_dir}'!\n"
-                f"Solution:\n"
-                f"   1. https://www.kaggle.com/datasets/iamsumat/spotify-top-2000s-mega-dataset\n"
-                f"   2. Click 'Download'\n"
-                f"   3. Extract ZIP to '{data_dir}' directory\n"
-                f"   4. Verify CSV file is in correct location"
-            )
         
         csv_path = csv_files[0]
         logger.info(f"CSV file found: {csv_path}")
@@ -287,23 +268,18 @@ class SpotifyDataStreamer:
         
         return event
     
-    def stream_historical_data(self, seconds_per_year=3, batch_size=15):
-        logger.info("Historical data streaming starting...")
-
+    def stream_historical_data(self, seconds_per_year=2, batch_size=25):
+        """Tüm yılları baştan sona Kafka'ya gönderir (tüm dataset)."""
+        yearly_data = self.data.groupby('year')
         total_songs = len(self.data)
         processed = 0
-
-        yearly_data = self.data.groupby('year')
-
+    
         for year, year_df in yearly_data:
-            logger.info(f"{year}: {len(year_df)} songs")
-
             start_time = time.time()
             year_df = year_df.reset_index(drop=True)
-
+    
             for i in range(0, len(year_df), batch_size):
                 batch = year_df.iloc[i:i+batch_size]
-
                 for _, song in batch.iterrows():
                     try:
                         event = self.create_song_event(song, 'historical')
@@ -313,17 +289,12 @@ class SpotifyDataStreamer:
                             value=event
                         )
                         processed += 1
-
-                        if processed % 100 == 0:
-                            progress = (processed / total_songs) * 100
-                            logger.info(f"Progress: {processed}/{total_songs} ({progress:.1f}%) - {song['artist']} - {song['title']}")
-
                     except Exception as e:
                         logger.error(f"Song send error: {e}")
-
+    
                 self.producer.poll(0)
-
-            # Real-time event injection (10% probability - increased from 5%)
+    
+            # Gerçek zamanlı event (10% olasılık)
             if random.random() < 0.10:
                 try:
                     rt_event = self.simulate_real_time_events()
@@ -332,28 +303,18 @@ class SpotifyDataStreamer:
                         key=rt_event['metadata']['event_id'],
                         value=rt_event
                     )
-                    song_title = rt_event['song_data']['title']
-                    artist = rt_event['song_data']['artist']
-                    reason = rt_event['metadata']['reason']
-                    old_pop = rt_event['metadata']['original_popularity']
-                    new_pop = rt_event['metadata']['new_popularity']
-                    event_id = rt_event['metadata']['event_id'][:8]  # Short ID for logging
-                    logger.info(f"Real-time event [{event_id}]: '{song_title}' by {artist} - {reason} ({old_pop}→{new_pop}) [30s timeout]")
                 except Exception as e:
                     logger.error(f"Real-time event error: {e}")
-
-            # Year timing balance
+    
+            # Yıllar arası bekleme
             elapsed = time.time() - start_time
-            remaining = max(0, seconds_per_year - elapsed)
-            if remaining > 0:
-                logger.info(f"{year} completed, waiting {remaining:.2f}s...")
-                time.sleep(remaining)
-
+            if elapsed < seconds_per_year:
+                time.sleep(seconds_per_year - elapsed)
+    
         self.producer.flush()
-        logger.info(f"Streaming completed! Total {processed} songs sent.")
-        logger.info(f"Kafka topics streamed:")
-        logger.info(f"   • {self.topics['historical_stream']}: {processed} historical events")
-        logger.info(f"   • {self.topics['real_time_events']}: ~{processed//10} real-time events")
+        logger.info(f"Streaming completed: {processed}/{total_songs} songs sent.")
+
+
     
     def close(self):
         logger.info("Stopping producer and timeout system...")
